@@ -1,0 +1,16 @@
+{
+  "name": "orbiters.unitypackagemanager.Editor",
+  "references": [
+    "orbiters.unitypackagemanager"
+  ],
+  "includePlatforms": [
+    "Editor"
+  ],
+  "excludePlatforms": [],
+  "allowUnsafeCode": false,
+  "autoReferenced": true,
+  "overrideReferences": false,
+  "precompiledReferences": [],
+  "defineConstraints": [],
+  "optionalUnityReferences": []
+}
