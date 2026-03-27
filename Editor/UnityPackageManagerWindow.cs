@@ -160,7 +160,7 @@ namespace Orbiters.UnityPackageManager.Editor
 
         private void DrawAssetRow(UnityPackageAssetInfo asset)
         {
-            var rowRect = EditorGUILayout.BeginHorizontal("box");
+            EditorGUILayout.BeginHorizontal("box");
             var isSelected = selectedAssetPaths.Contains(asset.OriginalAssetPath);
             var toggled = EditorGUILayout.Toggle(isSelected, GUILayout.Width(18f));
             if (toggled != isSelected)
@@ -175,6 +175,7 @@ namespace Orbiters.UnityPackageManager.Editor
             EditorGUILayout.LabelField(asset.HasMetaFile ? "meta" : string.Empty, GUILayout.Width(45f));
             EditorGUILayout.LabelField(asset.HasPreviewImage ? "preview" : string.Empty, GUILayout.Width(55f));
             EditorGUILayout.EndHorizontal();
+            var rowRect = GUILayoutUtility.GetLastRect();
 
             var currentEvent = Event.current;
             if (rowRect.Contains(currentEvent.mousePosition) && currentEvent.type == EventType.MouseDown && currentEvent.button == 0)
@@ -190,6 +191,7 @@ namespace Orbiters.UnityPackageManager.Editor
                 }
 
                 Repaint();
+                currentEvent.Use();
             }
 
             if (rowRect.Contains(currentEvent.mousePosition) && currentEvent.type == EventType.MouseDrag && currentEvent.button == 0)
