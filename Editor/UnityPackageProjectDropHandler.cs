@@ -34,20 +34,38 @@ namespace Orbiters.UnityPackageManager.Editor
             DragAndDrop.StartDrag($"Import {selectedAssets.Length} package asset(s)");
         }
 
-        private static void OnProjectWindowItemGui(string guid, Rect selectionRect)
+        public static void HandleFolderDrop(Rect dropRect, string targetFolder, System.Action<string> onDrop = null)
         {
             var currentEvent = Event.current;
-            if ((currentEvent.type != EventType.DragUpdated && currentEvent.type != EventType.DragPerform) ||
+            if (!dropRect.Contains(currentEvent.mousePosition) ||
+                (currentEvent.type != EventType.DragUpdated && currentEvent.type != EventType.DragPerform) ||
                 !(DragAndDrop.GetGenericData(DragPayloadKey) is DragPayload payload))
             {
                 return;
             }
 
-            if (!selectionRect.Contains(currentEvent.mousePosition))
+            DragAndDrop.visualMode = DragAndDropVisualMode.Copy;
+            if (currentEvent.type == EventType.DragPerform)
             {
-                return;
+                DragAndDrop.AcceptDrag();
+                UnityPackageManagerApi.ExtractAssets(
+                    payload.UnityPackagePath,
+                    payload.AssetPaths,
+                    targetFolder,
+                    new UnityPackageImportOptions
+                    {
+                        PreservePackageHierarchy = false,
+                        OverwriteExistingFiles = false
+                    });
+                DragAndDrop.SetGenericData(DragPayloadKey, null);
+                onDrop?.Invoke(targetFolder);
             }
 
+            currentEvent.Use();
+        }
+
+        private static void OnProjectWindowItemGui(string guid, Rect selectionRect)
+        {
             var assetPath = AssetDatabase.GUIDToAssetPath(guid);
             if (string.IsNullOrEmpty(assetPath))
             {
@@ -63,24 +81,7 @@ namespace Orbiters.UnityPackageManager.Editor
                 return;
             }
 
-            DragAndDrop.visualMode = DragAndDropVisualMode.Copy;
-
-            if (currentEvent.type == EventType.DragPerform)
-            {
-                DragAndDrop.AcceptDrag();
-                UnityPackageManagerApi.ExtractAssets(
-                    payload.UnityPackagePath,
-                    payload.AssetPaths,
-                    targetFolder,
-                    new UnityPackageImportOptions
-                    {
-                        PreservePackageHierarchy = false,
-                        OverwriteExistingFiles = false
-                    });
-                DragAndDrop.SetGenericData(DragPayloadKey, null);
-            }
-
-            currentEvent.Use();
+            HandleFolderDrop(selectionRect, targetFolder);
         }
 
         private sealed class DragPayload
