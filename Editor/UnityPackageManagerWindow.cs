@@ -92,8 +92,8 @@ namespace Orbiters.UnityPackageManager.Editor
             DrawToolbarButton("Add Files", "Add files into the package", "Toolbar Plus", editableArchive != null, AddFilesFromDialog);
             DrawToolbarButton("Remove", "Remove selected package entries", "Toolbar Minus", editableArchive != null && selectedAssetPaths.Count > 0, RemoveSelectedEntries);
             GUILayout.Space(4f);
-            DrawToolbarButton("Undo", "Undo last package edit", "Undo", editableArchive != null && undoStack.Count > 0, UndoLastEdit);
-            DrawToolbarButton("Redo", "Redo last undone package edit", "Redo", editableArchive != null && redoStack.Count > 0, RedoLastEdit);
+            DrawToolbarButton("Undo", "Undo last package edit", null, editableArchive != null && undoStack.Count > 0, UndoLastEdit);
+            DrawToolbarButton("Redo", "Redo last undone package edit", null, editableArchive != null && redoStack.Count > 0, RedoLastEdit);
 
             GUILayout.FlexibleSpace();
 
@@ -773,6 +773,7 @@ namespace Orbiters.UnityPackageManager.Editor
             });
             hasUnsavedChanges = true;
             ClearThumbnailCache();
+            FocusWindowForKeyboardShortcuts();
             Repaint();
         }
 
@@ -822,6 +823,7 @@ namespace Orbiters.UnityPackageManager.Editor
             });
             hasUnsavedChanges = true;
             ClearThumbnailCache();
+            FocusWindowForKeyboardShortcuts();
             Repaint();
         }
 
@@ -927,14 +929,64 @@ namespace Orbiters.UnityPackageManager.Editor
                 editableArchive.Entries.All(entry => !string.Equals(entry.OriginalAssetPath, path, StringComparison.OrdinalIgnoreCase)));
             hasUnsavedChanges = undoStack.Count > 0;
             ClearThumbnailCache();
+            FocusWindowForKeyboardShortcuts();
             Repaint();
         }
 
         private void HandleUndoRedoShortcuts()
         {
             var currentEvent = Event.current;
+            if (currentEvent.type == EventType.ValidateCommand || currentEvent.type == EventType.ExecuteCommand)
+            {
+                if (currentEvent.commandName == "Undo" && undoStack.Count > 0)
+                {
+                    if (currentEvent.type == EventType.ExecuteCommand)
+                    {
+                        UndoLastEdit();
+                    }
+
+                    currentEvent.Use();
+                    return;
+                }
+
+                if (currentEvent.commandName == "Redo" && redoStack.Count > 0)
+                {
+                    if (currentEvent.type == EventType.ExecuteCommand)
+                    {
+                        RedoLastEdit();
+                    }
+
+                    currentEvent.Use();
+                    return;
+                }
+
+                if ((currentEvent.commandName == "Delete" || currentEvent.commandName == "SoftDelete") &&
+                    editableArchive != null &&
+                    selectedAssetPaths.Count > 0)
+                {
+                    if (currentEvent.type == EventType.ExecuteCommand)
+                    {
+                        RemoveSelectedEntries();
+                    }
+
+                    currentEvent.Use();
+                    return;
+                }
+            }
+
             if (currentEvent.type != EventType.KeyDown)
             {
+                return;
+            }
+
+            if (currentEvent.keyCode == KeyCode.Delete || currentEvent.keyCode == KeyCode.Backspace)
+            {
+                if (editableArchive != null && selectedAssetPaths.Count > 0)
+                {
+                    RemoveSelectedEntries();
+                    currentEvent.Use();
+                }
+
                 return;
             }
 
@@ -1005,7 +1057,7 @@ namespace Orbiters.UnityPackageManager.Editor
             if (currentEvent.type == EventType.DragPerform)
             {
                 DragAndDrop.AcceptDrag();
-                AddFiles(droppedPaths);
+                AddFiles(droppedPaths.ToArray());
             }
 
             currentEvent.Use();
@@ -1013,13 +1065,19 @@ namespace Orbiters.UnityPackageManager.Editor
 
         private IEnumerable<string> GetDroppedPaths()
         {
+            var yieldedPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
             if (DragAndDrop.paths != null)
             {
                 foreach (var path in DragAndDrop.paths)
                 {
                     if (!string.IsNullOrWhiteSpace(path))
                     {
-                        yield return path;
+                        var fullPath = Path.GetFullPath(path);
+                        if (yieldedPaths.Add(fullPath))
+                        {
+                            yield return fullPath;
+                        }
                     }
                 }
             }
@@ -1036,7 +1094,11 @@ namespace Orbiters.UnityPackageManager.Editor
                     var assetPath = AssetDatabase.GetAssetPath(reference);
                     if (!string.IsNullOrWhiteSpace(assetPath))
                     {
-                        yield return Path.GetFullPath(Path.Combine(GetProjectRoot(), assetPath));
+                        var fullPath = Path.GetFullPath(Path.Combine(GetProjectRoot(), assetPath));
+                        if (yieldedPaths.Add(fullPath))
+                        {
+                            yield return fullPath;
+                        }
                     }
                 }
             }
@@ -1134,7 +1196,15 @@ namespace Orbiters.UnityPackageManager.Editor
         {
             using (new EditorGUI.DisabledScope(!enabled))
             {
-                var content = EditorGUIUtility.IconContent(iconName);
+                var content = string.IsNullOrWhiteSpace(iconName)
+                    ? new GUIContent(text, tooltip)
+                    : EditorGUIUtility.IconContent(iconName);
+
+                if (content == null)
+                {
+                    content = new GUIContent();
+                }
+
                 content.text = text;
                 content.tooltip = tooltip;
                 if (GUILayout.Button(content, EditorStyles.toolbarButton, GUILayout.Height(22f)))
@@ -1311,6 +1381,13 @@ namespace Orbiters.UnityPackageManager.Editor
                    ?? EditorGUIUtility.FindTexture(iconName)
                    ?? (EditorGUIUtility.IconContent("DefaultAsset Icon").image as Texture2D)
                    ?? EditorGUIUtility.FindTexture("DefaultAsset Icon");
+        }
+
+        private void FocusWindowForKeyboardShortcuts()
+        {
+            Focus();
+            GUI.FocusControl(null);
+            EditorGUIUtility.editingTextField = false;
         }
 
         private string GetSuggestedPackageName()
