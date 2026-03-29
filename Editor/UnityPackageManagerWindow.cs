@@ -10,10 +10,10 @@ namespace Orbiters.UnityPackageManager.Editor
     internal sealed class UnityPackageManagerWindow : EditorWindow
     {
         private const string DefaultDestinationFolder = "Assets";
-        private const float FolderTreeThresholdWidth = 900f;
+        private const float FolderTreeThresholdWidth = 1150f;
         private const float FolderTreeWidth = 280f;
-        private const float ThumbnailTileSize = 92f;
         private const string ViewModePrefKey = "Orbiters.UnityPackageManager.ViewMode";
+        private const string ThumbnailSizePrefKey = "Orbiters.UnityPackageManager.ThumbnailSize";
 
         private readonly UnityPackageArchiveService archiveService = new UnityPackageArchiveService();
         private readonly HashSet<string> selectedAssetPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -39,6 +39,7 @@ namespace Orbiters.UnityPackageManager.Editor
         private readonly Stack<PackageEditAction> redoStack = new Stack<PackageEditAction>();
         private readonly Dictionary<string, ThumbnailCacheItem> thumbnailCache = new Dictionary<string, ThumbnailCacheItem>(StringComparer.OrdinalIgnoreCase);
         private ViewMode currentViewMode = ViewMode.Thumbnail;
+        private float thumbnailTileSize = 92f;
 
         [MenuItem("Tools/Orbiters/UnityPackageManager")]
         private static void OpenWindow()
@@ -52,6 +53,7 @@ namespace Orbiters.UnityPackageManager.Editor
         private void OnEnable()
         {
             currentViewMode = (ViewMode)EditorPrefs.GetInt(ViewModePrefKey, (int)ViewMode.Thumbnail);
+            thumbnailTileSize = EditorPrefs.GetFloat(ThumbnailSizePrefKey, 92f);
             EditorApplication.projectChanged += MarkFolderTreeDirty;
         }
 
@@ -65,8 +67,7 @@ namespace Orbiters.UnityPackageManager.Editor
         {
             HandleUndoRedoShortcuts();
             DrawTopToolbar();
-            DrawPackagePicker();
-            DrawImportControls();
+            DrawTopPanels();
             DrawEditControls();
 
             if (ShouldShowFolderTree())
@@ -99,6 +100,18 @@ namespace Orbiters.UnityPackageManager.Editor
                 : hasUnsavedChanges ? "Unsaved changes" : "Saved";
             GUILayout.Label(status, EditorStyles.miniLabel);
 
+            EditorGUILayout.EndHorizontal();
+        }
+
+        private void DrawTopPanels()
+        {
+            EditorGUILayout.BeginHorizontal();
+            EditorGUILayout.BeginVertical(GUILayout.ExpandWidth(true));
+            DrawPackagePicker();
+            EditorGUILayout.EndVertical();
+            EditorGUILayout.BeginVertical(GUILayout.ExpandWidth(true));
+            DrawImportControls();
+            EditorGUILayout.EndVertical();
             EditorGUILayout.EndHorizontal();
         }
 
@@ -299,6 +312,16 @@ namespace Orbiters.UnityPackageManager.Editor
             }
 
             GUILayout.Space(8f);
+            GUILayout.Label("Size", EditorStyles.miniLabel, GUILayout.Width(28f));
+            var nextSize = GUILayout.HorizontalSlider(thumbnailTileSize, 56f, 160f, GUILayout.Width(90f));
+            if (!Mathf.Approximately(nextSize, thumbnailTileSize))
+            {
+                thumbnailTileSize = nextSize;
+                EditorPrefs.SetFloat(ThumbnailSizePrefKey, thumbnailTileSize);
+                Repaint();
+            }
+
+            GUILayout.Space(8f);
             GUILayout.Label("View", EditorStyles.miniLabel, GUILayout.Width(30f));
             DrawViewModeToggle(ViewMode.Thumbnail, "Grid", "thumbnail view");
             DrawViewModeToggle(ViewMode.List, "List", "list view");
@@ -429,7 +452,7 @@ namespace Orbiters.UnityPackageManager.Editor
         private void DrawThumbnailGrid(IReadOnlyList<EditableUnityPackageEntry> visibleEntries)
         {
             var availableWidth = Mathf.Max(120f, position.width - (ShouldShowFolderTree() ? FolderTreeWidth + 48f : 48f));
-            var columns = Mathf.Max(1, Mathf.FloorToInt(availableWidth / (ThumbnailTileSize + 16f)));
+            var columns = Mathf.Max(1, Mathf.FloorToInt(availableWidth / (thumbnailTileSize + 16f)));
             var index = 0;
 
             while (index < visibleEntries.Count)
@@ -450,8 +473,8 @@ namespace Orbiters.UnityPackageManager.Editor
             var assetInfo = entry.ToAssetInfo();
             var isSelected = selectedAssetPaths.Contains(entry.OriginalAssetPath);
 
-            EditorGUILayout.BeginVertical("box", GUILayout.Width(ThumbnailTileSize + 18f), GUILayout.Height(ThumbnailTileSize + 54f));
-            var previewRect = GUILayoutUtility.GetRect(ThumbnailTileSize, ThumbnailTileSize, GUILayout.Width(ThumbnailTileSize), GUILayout.Height(ThumbnailTileSize));
+            EditorGUILayout.BeginVertical("box", GUILayout.Width(thumbnailTileSize + 18f), GUILayout.Height(thumbnailTileSize + 54f));
+            var previewRect = GUILayoutUtility.GetRect(thumbnailTileSize, thumbnailTileSize, GUILayout.Width(thumbnailTileSize), GUILayout.Height(thumbnailTileSize));
             if (isSelected)
             {
                 EditorGUI.DrawRect(new Rect(previewRect.x - 2f, previewRect.y - 2f, previewRect.width + 4f, previewRect.height + 24f), new Color(0.18f, 0.35f, 0.62f, 0.25f));
@@ -464,7 +487,7 @@ namespace Orbiters.UnityPackageManager.Editor
             }
 
             GUILayout.Space(4f);
-            GUILayout.Label(assetInfo.AssetName, EditorStyles.miniLabel, GUILayout.Width(ThumbnailTileSize + 10f));
+            GUILayout.Label(assetInfo.AssetName, EditorStyles.miniLabel, GUILayout.Width(thumbnailTileSize + 10f));
             EditorGUILayout.EndVertical();
 
             var tileRect = GUILayoutUtility.GetLastRect();
@@ -1236,7 +1259,10 @@ namespace Orbiters.UnityPackageManager.Editor
 
         private Texture2D FindIconOrDefault(string iconName)
         {
-            return EditorGUIUtility.FindTexture(iconName) ?? EditorGUIUtility.FindTexture("DefaultAsset Icon");
+            return (EditorGUIUtility.IconContent(iconName).image as Texture2D)
+                   ?? EditorGUIUtility.FindTexture(iconName)
+                   ?? (EditorGUIUtility.IconContent("DefaultAsset Icon").image as Texture2D)
+                   ?? EditorGUIUtility.FindTexture("DefaultAsset Icon");
         }
 
         private string GetSuggestedPackageName()
