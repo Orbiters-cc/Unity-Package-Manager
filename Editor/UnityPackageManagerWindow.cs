@@ -10,19 +10,10 @@ namespace Orbiters.UnityPackageManager.Editor
     internal sealed class UnityPackageManagerWindow : EditorWindow
     {
         private const string DefaultDestinationFolder = "Assets";
-        private const float FolderTreeThresholdWidth = 1180f;
-        private const float FolderTreeMinWidth = 320f;
+        private const float FolderTreeThresholdWidth = 900f;
+        private const float FolderTreeWidth = 280f;
 
-        private string unityPackagePath = string.Empty;
-        private string searchQuery = string.Empty;
-        private string destinationFolder = DefaultDestinationFolder;
-        private bool preservePackageHierarchy = true;
-        private bool overwriteExistingFiles;
-        private Vector2 assetScrollPosition;
-        private Vector2 folderTreeScrollPosition;
-        private UnityPackageArchiveInfo archiveInfo;
-        private FolderNode folderTreeRoot;
-        private bool folderTreeDirty = true;
+        private readonly UnityPackageArchiveService archiveService = new UnityPackageArchiveService();
         private readonly HashSet<string> selectedAssetPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         private readonly HashSet<string> expandedFolderPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
         {
@@ -30,12 +21,25 @@ namespace Orbiters.UnityPackageManager.Editor
             "Packages"
         };
 
+        private string unityPackagePath = string.Empty;
+        private string loadedPackagePath = string.Empty;
+        private string searchQuery = string.Empty;
+        private string destinationFolder = DefaultDestinationFolder;
+        private bool preservePackageHierarchy = true;
+        private bool overwriteExistingFiles;
+        private bool hasUnsavedChanges;
+        private Vector2 assetScrollPosition;
+        private Vector2 folderTreeScrollPosition;
+        private EditableUnityPackageArchive editableArchive;
+        private FolderNode folderTreeRoot;
+        private bool folderTreeDirty = true;
+
         [MenuItem("Tools/Orbiters/UnityPackageManager")]
         private static void OpenWindow()
         {
             var window = GetWindow<UnityPackageManagerWindow>();
             window.titleContent = new GUIContent("UnityPackageManager");
-            window.minSize = new Vector2(860f, 420f);
+            window.minSize = new Vector2(300f, 420f);
             window.Show();
         }
 
@@ -53,7 +57,9 @@ namespace Orbiters.UnityPackageManager.Editor
         {
             DrawHeader();
             DrawPackagePicker();
-            DrawImportOptions();
+            DrawSaveControls();
+            DrawImportControls();
+            DrawEditControls();
             DrawToolbar();
 
             if (ShouldShowFolderTree())
@@ -62,7 +68,7 @@ namespace Orbiters.UnityPackageManager.Editor
             }
             else
             {
-                DrawNarrowLayout();
+                DrawAssetPane();
             }
         }
 
@@ -72,8 +78,8 @@ namespace Orbiters.UnityPackageManager.Editor
             EditorGUILayout.LabelField("UnityPackageManager", EditorStyles.boldLabel);
 
             var message = ShouldShowFolderTree()
-                ? "Inspect .unitypackage archives, select files, then import them or drag them directly onto the folder tree."
-                : "Inspect .unitypackage archives, select files, then import them. Widen the window to enable the in-window folder tree for drag and drop.";
+                ? "Inspect, edit, and save .unitypackage archives. Drag selected files onto the folder tree to import them into the project."
+                : "Inspect, edit, and save .unitypackage archives. Widen the window to reveal the in-window folder tree.";
 
             EditorGUILayout.HelpBox(message, MessageType.Info);
         }
@@ -86,9 +92,11 @@ namespace Orbiters.UnityPackageManager.Editor
             var rect = EditorGUILayout.GetControlRect();
             rect = EditorGUI.PrefixLabel(rect, new GUIContent("File"));
 
-            var browseRect = new Rect(rect.xMax - 90f, rect.y, 90f, rect.height);
-            var loadRect = new Rect(rect.xMax - 165f, rect.y, 70f, rect.height);
-            var fieldRect = new Rect(rect.x, rect.y, rect.width - 170f, rect.height);
+            const float browseWidth = 90f;
+            const float loadWidth = 70f;
+            var browseRect = new Rect(rect.xMax - browseWidth, rect.y, browseWidth, rect.height);
+            var loadRect = new Rect(rect.xMax - browseWidth - 5f - loadWidth, rect.y, loadWidth, rect.height);
+            var fieldRect = new Rect(rect.x, rect.y, rect.width - browseWidth - loadWidth - 10f, rect.height);
 
             unityPackagePath = EditorGUI.TextField(fieldRect, unityPackagePath);
             HandlePackageFileDrop(fieldRect);
@@ -108,14 +116,51 @@ namespace Orbiters.UnityPackageManager.Editor
                 }
             }
 
-            EditorGUILayout.HelpBox("Drop any file from the OS or Unity onto the File field. The tool only loads .unitypackage archives.", MessageType.None);
+            var status = string.IsNullOrWhiteSpace(loadedPackagePath)
+                ? "No package loaded."
+                : (hasUnsavedChanges ? "Loaded package has unsaved changes." : "Loaded package is in sync with disk.");
+            EditorGUILayout.LabelField(status, EditorStyles.miniLabel);
+            EditorGUILayout.HelpBox("Drop any file onto the File field. Only .unitypackage files can be loaded.", MessageType.None);
             EditorGUILayout.EndVertical();
         }
 
-        private void DrawImportOptions()
+        private void DrawSaveControls()
         {
             EditorGUILayout.BeginVertical("box");
-            EditorGUILayout.LabelField("Import Options", EditorStyles.boldLabel);
+            EditorGUILayout.LabelField("Package Editing", EditorStyles.boldLabel);
+            EditorGUILayout.BeginHorizontal();
+
+            using (new EditorGUI.DisabledScope(editableArchive == null))
+            {
+                if (GUILayout.Button("Save", GUILayout.Width(90f)))
+                {
+                    SaveArchive(false);
+                }
+
+                if (GUILayout.Button("Save As...", GUILayout.Width(90f)))
+                {
+                    SaveArchive(true);
+                }
+
+                if (GUILayout.Button("Add Files...", GUILayout.Width(100f)))
+                {
+                    AddFilesFromDialog();
+                }
+
+                if (GUILayout.Button("Remove Selected", GUILayout.Width(120f)))
+                {
+                    RemoveSelectedEntries();
+                }
+            }
+
+            EditorGUILayout.EndHorizontal();
+            EditorGUILayout.EndVertical();
+        }
+
+        private void DrawImportControls()
+        {
+            EditorGUILayout.BeginVertical("box");
+            EditorGUILayout.LabelField("Import Into Project", EditorStyles.boldLabel);
             EditorGUILayout.BeginHorizontal();
             destinationFolder = EditorGUILayout.TextField("Destination", destinationFolder);
             if (GUILayout.Button("Pick Folder", GUILayout.Width(90f)))
@@ -127,9 +172,12 @@ namespace Orbiters.UnityPackageManager.Editor
                 }
             }
 
-            if (GUILayout.Button("Import Selected", GUILayout.Width(120f)))
+            using (new EditorGUI.DisabledScope(editableArchive == null || selectedAssetPaths.Count == 0))
             {
-                ImportSelected();
+                if (GUILayout.Button("Import Selected", GUILayout.Width(120f)))
+                {
+                    ImportSelected();
+                }
             }
 
             EditorGUILayout.EndHorizontal();
@@ -139,16 +187,30 @@ namespace Orbiters.UnityPackageManager.Editor
             EditorGUILayout.EndVertical();
         }
 
+        private void DrawEditControls()
+        {
+            EditorGUILayout.BeginHorizontal();
+            using (new EditorGUI.DisabledScope(editableArchive == null))
+            {
+                if (GUILayout.Button("Add Selected Project Assets"))
+                {
+                    AddSelectedProjectAssets();
+                }
+            }
+
+            EditorGUILayout.EndHorizontal();
+        }
+
         private void DrawToolbar()
         {
             EditorGUILayout.BeginHorizontal();
             searchQuery = EditorGUILayout.TextField("Search", searchQuery);
 
-            using (new EditorGUI.DisabledScope(archiveInfo == null || archiveInfo.Assets.Count == 0))
+            using (new EditorGUI.DisabledScope(editableArchive == null || editableArchive.Entries.Count == 0))
             {
                 if (GUILayout.Button("Select All Visible", GUILayout.Width(120f)))
                 {
-                    foreach (var asset in GetVisibleAssets())
+                    foreach (var asset in GetVisibleEntries())
                     {
                         selectedAssetPaths.Add(asset.OriginalAssetPath);
                     }
@@ -162,10 +224,10 @@ namespace Orbiters.UnityPackageManager.Editor
 
             EditorGUILayout.EndHorizontal();
 
-            if (archiveInfo != null)
+            if (editableArchive != null)
             {
                 EditorGUILayout.LabelField(
-                    $"{archiveInfo.Assets.Count} assets | {FormatSize(archiveInfo.PackageFileSizeBytes)} archive size | {selectedAssetPaths.Count} selected",
+                    $"{editableArchive.Entries.Count} assets | {FormatSize(editableArchive.PackageFileSizeBytes)} source size | {selectedAssetPaths.Count} selected",
                     EditorStyles.miniLabel);
             }
         }
@@ -174,47 +236,50 @@ namespace Orbiters.UnityPackageManager.Editor
         {
             EditorGUILayout.BeginHorizontal();
 
-            EditorGUILayout.BeginVertical(GUILayout.MinWidth(position.width - FolderTreeMinWidth - 24f));
-            DrawAssetList();
+            EditorGUILayout.BeginVertical("box", GUILayout.Width(FolderTreeWidth));
+            DrawFolderTreePanel();
             EditorGUILayout.EndVertical();
 
-            EditorGUILayout.BeginVertical("box", GUILayout.Width(FolderTreeMinWidth));
-            DrawFolderTreePanel();
+            EditorGUILayout.BeginVertical();
+            DrawAssetPane();
             EditorGUILayout.EndVertical();
 
             EditorGUILayout.EndHorizontal();
         }
 
-        private void DrawNarrowLayout()
-        {
-            DrawAssetList();
-        }
-
-        private void DrawAssetList()
+        private void DrawAssetPane()
         {
             EditorGUILayout.Space();
             EditorGUILayout.LabelField("Contents", EditorStyles.boldLabel);
 
-            if (archiveInfo == null)
+            if (editableArchive == null)
             {
-                EditorGUILayout.HelpBox("Load a .unitypackage file to inspect its contents.", MessageType.None);
+                EditorGUILayout.HelpBox("Load a .unitypackage file to inspect and edit its contents.", MessageType.None);
                 return;
             }
 
-            var visibleAssets = GetVisibleAssets().ToArray();
-            if (visibleAssets.Length == 0)
+            var listRect = GUILayoutUtility.GetRect(10f, 100000f, 200f, 100000f);
+            GUI.Box(listRect, GUIContent.none);
+            HandleAddFilesDrop(listRect);
+
+            GUILayout.BeginArea(new Rect(listRect.x + 4f, listRect.y + 4f, listRect.width - 8f, listRect.height - 8f));
+            var visibleEntries = GetVisibleEntries().ToArray();
+            if (visibleEntries.Length == 0)
             {
                 EditorGUILayout.HelpBox("No assets match the current search.", MessageType.None);
-                return;
             }
-
-            assetScrollPosition = EditorGUILayout.BeginScrollView(assetScrollPosition);
-            foreach (var asset in visibleAssets)
+            else
             {
-                DrawAssetRow(asset);
+                assetScrollPosition = EditorGUILayout.BeginScrollView(assetScrollPosition);
+                foreach (var entry in visibleEntries)
+                {
+                    DrawAssetRow(entry);
+                }
+
+                EditorGUILayout.EndScrollView();
             }
 
-            EditorGUILayout.EndScrollView();
+            GUILayout.EndArea();
         }
 
         private void DrawFolderTreePanel()
@@ -222,7 +287,7 @@ namespace Orbiters.UnityPackageManager.Editor
             EnsureFolderTreeBuilt();
 
             EditorGUILayout.LabelField("Project Folders", EditorStyles.boldLabel);
-            EditorGUILayout.LabelField("Drag selected package files onto a folder below.", EditorStyles.miniLabel);
+            EditorGUILayout.LabelField("Drag selected package files onto a folder to import them.", EditorStyles.miniLabel);
             EditorGUILayout.Space(4f);
 
             folderTreeScrollPosition = EditorGUILayout.BeginScrollView(folderTreeScrollPosition);
@@ -256,8 +321,7 @@ namespace Orbiters.UnityPackageManager.Editor
                 }
             }
 
-            var isSelectedDestination = string.Equals(destinationFolder, node.ProjectPath, StringComparison.OrdinalIgnoreCase);
-            if (isSelectedDestination)
+            if (string.Equals(destinationFolder, node.ProjectPath, StringComparison.OrdinalIgnoreCase))
             {
                 EditorGUI.DrawRect(rowRect, new Color(0.18f, 0.35f, 0.62f, 0.35f));
             }
@@ -286,22 +350,24 @@ namespace Orbiters.UnityPackageManager.Editor
             }
         }
 
-        private void DrawAssetRow(UnityPackageAssetInfo asset)
+        private void DrawAssetRow(EditableUnityPackageEntry entry)
         {
+            var assetInfo = entry.ToAssetInfo();
+
             EditorGUILayout.BeginHorizontal("box");
-            var isSelected = selectedAssetPaths.Contains(asset.OriginalAssetPath);
+            var isSelected = selectedAssetPaths.Contains(entry.OriginalAssetPath);
             var toggled = EditorGUILayout.Toggle(isSelected, GUILayout.Width(18f));
             if (toggled != isSelected)
             {
-                SetSelection(asset.OriginalAssetPath, toggled);
+                SetSelection(entry.OriginalAssetPath, toggled);
             }
 
-            EditorGUILayout.LabelField(asset.AssetName, GUILayout.Width(220f));
-            EditorGUILayout.LabelField(asset.OriginalAssetPath, GUILayout.MinWidth(300f));
-            EditorGUILayout.LabelField(FormatSize(asset.AssetSizeBytes), GUILayout.Width(95f));
-            EditorGUILayout.LabelField(asset.FileExtension, GUILayout.Width(65f));
-            EditorGUILayout.LabelField(asset.HasMetaFile ? "meta" : string.Empty, GUILayout.Width(45f));
-            EditorGUILayout.LabelField(asset.HasPreviewImage ? "preview" : string.Empty, GUILayout.Width(55f));
+            EditorGUILayout.LabelField(assetInfo.AssetName, GUILayout.Width(220f));
+            EditorGUILayout.LabelField(assetInfo.OriginalAssetPath, GUILayout.MinWidth(280f));
+            EditorGUILayout.LabelField(FormatSize(assetInfo.AssetSizeBytes), GUILayout.Width(95f));
+            EditorGUILayout.LabelField(assetInfo.FileExtension, GUILayout.Width(65f));
+            EditorGUILayout.LabelField(assetInfo.HasMetaFile ? "meta" : string.Empty, GUILayout.Width(45f));
+            EditorGUILayout.LabelField(assetInfo.HasPreviewImage ? "preview" : string.Empty, GUILayout.Width(55f));
             EditorGUILayout.EndHorizontal();
             var rowRect = GUILayoutUtility.GetLastRect();
 
@@ -311,11 +377,11 @@ namespace Orbiters.UnityPackageManager.Editor
                 if (!currentEvent.control && !currentEvent.command)
                 {
                     selectedAssetPaths.Clear();
-                    selectedAssetPaths.Add(asset.OriginalAssetPath);
+                    selectedAssetPaths.Add(entry.OriginalAssetPath);
                 }
                 else
                 {
-                    SetSelection(asset.OriginalAssetPath, !isSelected);
+                    SetSelection(entry.OriginalAssetPath, !isSelected);
                 }
 
                 Repaint();
@@ -324,45 +390,50 @@ namespace Orbiters.UnityPackageManager.Editor
 
             if (rowRect.Contains(currentEvent.mousePosition) && currentEvent.type == EventType.MouseDrag && currentEvent.button == 0)
             {
-                UnityPackageProjectDropHandler.BeginDrag(unityPackagePath, GetDragSelection(asset));
+                UnityPackageProjectDropHandler.BeginDrag(unityPackagePath, GetDragSelection(entry));
                 currentEvent.Use();
             }
         }
 
-        private IEnumerable<UnityPackageAssetInfo> GetDragSelection(UnityPackageAssetInfo fallback)
+        private IEnumerable<UnityPackageAssetInfo> GetDragSelection(EditableUnityPackageEntry fallback)
         {
             if (!selectedAssetPaths.Contains(fallback.OriginalAssetPath))
             {
-                return new[] { fallback };
+                return new[] { fallback.ToAssetInfo() };
             }
 
-            return archiveInfo.Assets.Where(asset => selectedAssetPaths.Contains(asset.OriginalAssetPath));
+            return editableArchive.Entries
+                .Where(entry => selectedAssetPaths.Contains(entry.OriginalAssetPath))
+                .Select(entry => entry.ToAssetInfo());
         }
 
-        private IEnumerable<UnityPackageAssetInfo> GetVisibleAssets()
+        private IEnumerable<EditableUnityPackageEntry> GetVisibleEntries()
         {
-            if (archiveInfo == null)
+            if (editableArchive == null)
             {
-                return Enumerable.Empty<UnityPackageAssetInfo>();
+                return Enumerable.Empty<EditableUnityPackageEntry>();
             }
 
             if (string.IsNullOrWhiteSpace(searchQuery))
             {
-                return archiveInfo.Assets;
+                return editableArchive.Entries;
             }
 
-            return archiveInfo.Assets.Where(asset =>
-                asset.AssetName.IndexOf(searchQuery, StringComparison.OrdinalIgnoreCase) >= 0 ||
-                asset.OriginalAssetPath.IndexOf(searchQuery, StringComparison.OrdinalIgnoreCase) >= 0 ||
-                asset.DirectoryPath.IndexOf(searchQuery, StringComparison.OrdinalIgnoreCase) >= 0);
+            return editableArchive.Entries.Where(entry =>
+                entry.AssetName.IndexOf(searchQuery, StringComparison.OrdinalIgnoreCase) >= 0 ||
+                entry.OriginalAssetPath.IndexOf(searchQuery, StringComparison.OrdinalIgnoreCase) >= 0 ||
+                entry.DirectoryPath.IndexOf(searchQuery, StringComparison.OrdinalIgnoreCase) >= 0);
         }
 
         private void LoadArchive()
         {
             try
             {
-                archiveInfo = UnityPackageManagerApi.ReadArchive(unityPackagePath);
+                editableArchive = archiveService.ReadEditableArchive(unityPackagePath);
+                loadedPackagePath = editableArchive.PackageFilePath;
+                unityPackagePath = editableArchive.PackageFilePath;
                 selectedAssetPaths.Clear();
+                hasUnsavedChanges = false;
             }
             catch (Exception exception)
             {
@@ -373,7 +444,7 @@ namespace Orbiters.UnityPackageManager.Editor
 
         private void ImportSelected()
         {
-            if (archiveInfo == null)
+            if (editableArchive == null)
             {
                 EditorUtility.DisplayDialog("UnityPackageManager", "Load a .unitypackage first.", "OK");
                 return;
@@ -387,8 +458,9 @@ namespace Orbiters.UnityPackageManager.Editor
 
             try
             {
+                var tempPath = SaveToTemporaryArchive();
                 var imported = UnityPackageManagerApi.ExtractAssets(
-                    unityPackagePath,
+                    tempPath,
                     selectedAssetPaths,
                     destinationFolder,
                     new UnityPackageImportOptions
@@ -396,6 +468,8 @@ namespace Orbiters.UnityPackageManager.Editor
                         PreservePackageHierarchy = preservePackageHierarchy,
                         OverwriteExistingFiles = overwriteExistingFiles
                     });
+
+                File.Delete(tempPath);
 
                 if (imported.Count > 0)
                 {
@@ -409,6 +483,140 @@ namespace Orbiters.UnityPackageManager.Editor
             }
         }
 
+        private string SaveToTemporaryArchive()
+        {
+            var tempPath = Path.Combine(Path.GetTempPath(), "orbiters-upm-" + Guid.NewGuid().ToString("N") + ".unitypackage");
+            archiveService.SaveArchive(tempPath, editableArchive.Entries);
+            return tempPath;
+        }
+
+        private void SaveArchive(bool saveAs)
+        {
+            if (editableArchive == null)
+            {
+                return;
+            }
+
+            try
+            {
+                var outputPath = loadedPackagePath;
+                if (saveAs || string.IsNullOrWhiteSpace(outputPath))
+                {
+                    outputPath = EditorUtility.SaveFilePanel("Save .unitypackage", GetInitialDirectory(), GetSuggestedPackageName(), "unitypackage");
+                }
+
+                if (string.IsNullOrWhiteSpace(outputPath))
+                {
+                    return;
+                }
+
+                archiveService.SaveArchive(outputPath, editableArchive.Entries);
+                unityPackagePath = outputPath;
+                loadedPackagePath = outputPath;
+                hasUnsavedChanges = false;
+                editableArchive.PackageFilePath = outputPath;
+                editableArchive.PackageFileSizeBytes = new FileInfo(outputPath).Length;
+                editableArchive.LastWriteTimeUtc = File.GetLastWriteTimeUtc(outputPath);
+                EditorUtility.DisplayDialog("UnityPackageManager", "Package saved.", "OK");
+            }
+            catch (Exception exception)
+            {
+                Debug.LogException(exception);
+                EditorUtility.DisplayDialog("UnityPackageManager", exception.Message, "OK");
+            }
+        }
+
+        private void AddFilesFromDialog()
+        {
+            var selected = EditorUtility.OpenFilePanel("Add file to package", GetInitialDirectory(), string.Empty);
+            if (string.IsNullOrWhiteSpace(selected))
+            {
+                return;
+            }
+
+            AddFiles(new[] { selected });
+        }
+
+        private void AddSelectedProjectAssets()
+        {
+            var selectedPaths = Selection.assetGUIDs
+                .Select(AssetDatabase.GUIDToAssetPath)
+                .Where(path => !string.IsNullOrWhiteSpace(path))
+                .Select(path => Path.GetFullPath(Path.Combine(GetProjectRoot(), path)))
+                .ToArray();
+
+            if (selectedPaths.Length == 0)
+            {
+                EditorUtility.DisplayDialog("UnityPackageManager", "Select one or more project assets first.", "OK");
+                return;
+            }
+
+            AddFiles(selectedPaths);
+        }
+
+        private void AddFiles(IEnumerable<string> sourcePaths)
+        {
+            if (editableArchive == null)
+            {
+                EditorUtility.DisplayDialog("UnityPackageManager", "Load a package before adding files.", "OK");
+                return;
+            }
+
+            foreach (var sourcePath in ExpandSourcePaths(sourcePaths))
+            {
+                var entry = archiveService.CreateEntryFromFile(sourcePath);
+                editableArchive.Entries.RemoveAll(existing =>
+                    string.Equals(existing.OriginalAssetPath, entry.OriginalAssetPath, StringComparison.OrdinalIgnoreCase));
+                editableArchive.Entries.Add(entry);
+                selectedAssetPaths.Add(entry.OriginalAssetPath);
+            }
+
+            editableArchive.Entries = editableArchive.Entries
+                .OrderBy(entry => entry.OriginalAssetPath, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            hasUnsavedChanges = true;
+            Repaint();
+        }
+
+        private IEnumerable<string> ExpandSourcePaths(IEnumerable<string> sourcePaths)
+        {
+            foreach (var path in sourcePaths ?? Enumerable.Empty<string>())
+            {
+                if (string.IsNullOrWhiteSpace(path))
+                {
+                    continue;
+                }
+
+                var fullPath = Path.GetFullPath(path);
+                if (Directory.Exists(fullPath))
+                {
+                    foreach (var file in Directory.GetFiles(fullPath, "*", SearchOption.AllDirectories)
+                                 .Where(file => !file.EndsWith(".meta", StringComparison.OrdinalIgnoreCase)))
+                    {
+                        yield return file;
+                    }
+                }
+                else if (File.Exists(fullPath))
+                {
+                    yield return fullPath;
+                }
+            }
+        }
+
+        private void RemoveSelectedEntries()
+        {
+            if (editableArchive == null || selectedAssetPaths.Count == 0)
+            {
+                return;
+            }
+
+            editableArchive.Entries.RemoveAll(entry => selectedAssetPaths.Contains(entry.OriginalAssetPath));
+            selectedAssetPaths.Clear();
+            hasUnsavedChanges = true;
+            Repaint();
+        }
+
         private void HandlePackageFileDrop(Rect fieldRect)
         {
             var currentEvent = Event.current;
@@ -418,7 +626,7 @@ namespace Orbiters.UnityPackageManager.Editor
                 return;
             }
 
-            var droppedPath = GetFirstDroppedFilePath();
+            var droppedPath = GetFirstDroppedPath();
             if (string.IsNullOrWhiteSpace(droppedPath))
             {
                 return;
@@ -439,7 +647,32 @@ namespace Orbiters.UnityPackageManager.Editor
             currentEvent.Use();
         }
 
-        private string GetFirstDroppedFilePath()
+        private void HandleAddFilesDrop(Rect dropRect)
+        {
+            var currentEvent = Event.current;
+            if (!dropRect.Contains(currentEvent.mousePosition) ||
+                (currentEvent.type != EventType.DragUpdated && currentEvent.type != EventType.DragPerform))
+            {
+                return;
+            }
+
+            var droppedPaths = GetDroppedPaths().ToArray();
+            if (droppedPaths.Length == 0 || editableArchive == null)
+            {
+                return;
+            }
+
+            DragAndDrop.visualMode = DragAndDropVisualMode.Copy;
+            if (currentEvent.type == EventType.DragPerform)
+            {
+                DragAndDrop.AcceptDrag();
+                AddFiles(droppedPaths);
+            }
+
+            currentEvent.Use();
+        }
+
+        private IEnumerable<string> GetDroppedPaths()
         {
             if (DragAndDrop.paths != null)
             {
@@ -447,7 +680,7 @@ namespace Orbiters.UnityPackageManager.Editor
                 {
                     if (!string.IsNullOrWhiteSpace(path))
                     {
-                        return path;
+                        yield return path;
                     }
                 }
             }
@@ -464,13 +697,15 @@ namespace Orbiters.UnityPackageManager.Editor
                     var assetPath = AssetDatabase.GetAssetPath(reference);
                     if (!string.IsNullOrWhiteSpace(assetPath))
                     {
-                        var absolutePath = Path.GetFullPath(Path.Combine(GetProjectRoot(), assetPath));
-                        return absolutePath;
+                        yield return Path.GetFullPath(Path.Combine(GetProjectRoot(), assetPath));
                     }
                 }
             }
+        }
 
-            return null;
+        private string GetFirstDroppedPath()
+        {
+            return GetDroppedPaths().FirstOrDefault();
         }
 
         private void EnsureFolderTreeBuilt()
@@ -556,6 +791,16 @@ namespace Orbiters.UnityPackageManager.Editor
             return position.width >= FolderTreeThresholdWidth;
         }
 
+        private string GetSuggestedPackageName()
+        {
+            if (!string.IsNullOrWhiteSpace(loadedPackagePath))
+            {
+                return Path.GetFileNameWithoutExtension(loadedPackagePath);
+            }
+
+            return "EditedPackage";
+        }
+
         private static string GetProjectRoot()
         {
             return Path.GetFullPath(Path.Combine(Application.dataPath, ".."));
@@ -563,9 +808,19 @@ namespace Orbiters.UnityPackageManager.Editor
 
         private string GetInitialDirectory()
         {
-            if (!string.IsNullOrWhiteSpace(unityPackagePath) && File.Exists(unityPackagePath))
+            if (!string.IsNullOrWhiteSpace(unityPackagePath))
             {
-                return Path.GetDirectoryName(unityPackagePath);
+                var candidate = unityPackagePath;
+                if (File.Exists(candidate))
+                {
+                    return Path.GetDirectoryName(candidate);
+                }
+
+                var directory = Path.GetDirectoryName(candidate);
+                if (!string.IsNullOrWhiteSpace(directory) && Directory.Exists(directory))
+                {
+                    return directory;
+                }
             }
 
             return GetProjectRoot();
