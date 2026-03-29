@@ -12,6 +12,8 @@ namespace Orbiters.UnityPackageManager.Editor
         private const string DefaultDestinationFolder = "Assets";
         private const float FolderTreeThresholdWidth = 900f;
         private const float FolderTreeWidth = 280f;
+        private const float ThumbnailTileSize = 92f;
+        private const string ViewModePrefKey = "Orbiters.UnityPackageManager.ViewMode";
 
         private readonly UnityPackageArchiveService archiveService = new UnityPackageArchiveService();
         private readonly HashSet<string> selectedAssetPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -35,6 +37,8 @@ namespace Orbiters.UnityPackageManager.Editor
         private bool folderTreeDirty = true;
         private readonly Stack<PackageEditAction> undoStack = new Stack<PackageEditAction>();
         private readonly Stack<PackageEditAction> redoStack = new Stack<PackageEditAction>();
+        private readonly Dictionary<string, ThumbnailCacheItem> thumbnailCache = new Dictionary<string, ThumbnailCacheItem>(StringComparer.OrdinalIgnoreCase);
+        private ViewMode currentViewMode = ViewMode.Thumbnail;
 
         [MenuItem("Tools/Orbiters/UnityPackageManager")]
         private static void OpenWindow()
@@ -47,23 +51,23 @@ namespace Orbiters.UnityPackageManager.Editor
 
         private void OnEnable()
         {
+            currentViewMode = (ViewMode)EditorPrefs.GetInt(ViewModePrefKey, (int)ViewMode.Thumbnail);
             EditorApplication.projectChanged += MarkFolderTreeDirty;
         }
 
         private void OnDisable()
         {
             EditorApplication.projectChanged -= MarkFolderTreeDirty;
+            ClearThumbnailCache();
         }
 
         private void OnGUI()
         {
             HandleUndoRedoShortcuts();
-            DrawHeader();
+            DrawTopToolbar();
             DrawPackagePicker();
-            DrawSaveControls();
             DrawImportControls();
             DrawEditControls();
-            DrawToolbar();
 
             if (ShouldShowFolderTree())
             {
@@ -75,16 +79,27 @@ namespace Orbiters.UnityPackageManager.Editor
             }
         }
 
-        private void DrawHeader()
+        private void DrawTopToolbar()
         {
-            EditorGUILayout.Space();
-            EditorGUILayout.LabelField("UnityPackageManager", EditorStyles.boldLabel);
+            EditorGUILayout.BeginHorizontal(EditorStyles.toolbar);
 
-            var message = ShouldShowFolderTree()
-                ? "Inspect, edit, and save .unitypackage archives. Drag selected files onto the folder tree to import them into the project."
-                : "Inspect, edit, and save .unitypackage archives. Widen the window to reveal the in-window folder tree.";
+            DrawToolbarButton("Save", "Save active package", "SaveActive", editableArchive != null, () => SaveArchive(false));
+            DrawToolbarButton("Save As", "Save package to a new file", "SaveAs", editableArchive != null, () => SaveArchive(true));
+            GUILayout.Space(4f);
+            DrawToolbarButton("Add Files", "Add files into the package", "Toolbar Plus", editableArchive != null, AddFilesFromDialog);
+            DrawToolbarButton("Remove", "Remove selected package entries", "Toolbar Minus", editableArchive != null && selectedAssetPaths.Count > 0, RemoveSelectedEntries);
+            GUILayout.Space(4f);
+            DrawToolbarButton("Undo", "Undo last package edit", "Undo", editableArchive != null && undoStack.Count > 0, UndoLastEdit);
+            DrawToolbarButton("Redo", "Redo last undone package edit", "Redo", editableArchive != null && redoStack.Count > 0, RedoLastEdit);
 
-            EditorGUILayout.HelpBox(message, MessageType.Info);
+            GUILayout.FlexibleSpace();
+
+            var status = string.IsNullOrWhiteSpace(loadedPackagePath)
+                ? "No package loaded"
+                : hasUnsavedChanges ? "Unsaved changes" : "Saved";
+            GUILayout.Label(status, EditorStyles.miniLabel);
+
+            EditorGUILayout.EndHorizontal();
         }
 
         private void DrawPackagePicker()
@@ -119,66 +134,11 @@ namespace Orbiters.UnityPackageManager.Editor
                 }
             }
 
-            var status = string.IsNullOrWhiteSpace(loadedPackagePath)
-                ? "No package loaded."
-                : (hasUnsavedChanges ? "Loaded package has unsaved changes." : "Loaded package is in sync with disk.");
-            EditorGUILayout.LabelField(status, EditorStyles.miniLabel);
+            var message = ShouldShowFolderTree()
+                ? "Drag selected files onto the folder tree to import them into the project."
+                : "Widen the window to reveal the in-window folder tree.";
+            EditorGUILayout.LabelField(message, EditorStyles.miniLabel);
             EditorGUILayout.HelpBox("Drop any file onto the File field. Only .unitypackage files can be loaded.", MessageType.None);
-            EditorGUILayout.EndVertical();
-        }
-
-        private void DrawSaveControls()
-        {
-            EditorGUILayout.BeginVertical("box");
-            EditorGUILayout.LabelField("Package Editing", EditorStyles.boldLabel);
-            EditorGUILayout.BeginHorizontal();
-
-            using (new EditorGUI.DisabledScope(editableArchive == null))
-            {
-                if (GUILayout.Button("Save", GUILayout.Width(90f)))
-                {
-                    SaveArchive(false);
-                }
-
-                if (GUILayout.Button("Save As...", GUILayout.Width(90f)))
-                {
-                    SaveArchive(true);
-                }
-
-                if (GUILayout.Button("Add Files...", GUILayout.Width(100f)))
-                {
-                    AddFilesFromDialog();
-                }
-
-                if (GUILayout.Button("Remove Selected", GUILayout.Width(120f)))
-                {
-                    RemoveSelectedEntries();
-                }
-
-                using (new EditorGUI.DisabledScope(undoStack.Count == 0))
-                {
-                    if (GUILayout.Button("Undo", GUILayout.Width(70f)))
-                    {
-                        UndoLastEdit();
-                    }
-                }
-
-                using (new EditorGUI.DisabledScope(redoStack.Count == 0))
-                {
-                    if (GUILayout.Button("Redo", GUILayout.Width(70f)))
-                    {
-                        RedoLastEdit();
-                    }
-                }
-            }
-
-            EditorGUILayout.EndHorizontal();
-            if (editableArchive != null)
-            {
-                EditorGUILayout.LabelField(
-                    $"Undo: {undoStack.Count} | Redo: {redoStack.Count}",
-                    EditorStyles.miniLabel);
-            }
             EditorGUILayout.EndVertical();
         }
 
@@ -214,47 +174,50 @@ namespace Orbiters.UnityPackageManager.Editor
 
         private void DrawEditControls()
         {
+            EditorGUILayout.BeginVertical("box");
+            EditorGUILayout.LabelField("Project Selection", EditorStyles.boldLabel);
+
+            var activeObject = Selection.activeObject;
+            var activePath = activeObject != null ? AssetDatabase.GetAssetPath(activeObject) : string.Empty;
+            var selectionCount = Selection.objects?.Length ?? 0;
+            var hasSelection = !string.IsNullOrWhiteSpace(activePath);
+
             EditorGUILayout.BeginHorizontal();
-            using (new EditorGUI.DisabledScope(editableArchive == null))
+            var previewTexture = GetProjectSelectionPreview(activeObject, activePath);
+            var previewRect = GUILayoutUtility.GetRect(48f, 48f, GUILayout.Width(48f), GUILayout.Height(48f));
+            if (previewTexture != null)
             {
-                if (GUILayout.Button("Add Selected Project Assets"))
+                GUI.DrawTexture(previewRect, previewTexture, ScaleMode.ScaleToFit, true);
+            }
+
+            EditorGUILayout.BeginVertical();
+            if (selectionCount <= 0)
+            {
+                EditorGUILayout.LabelField("No project asset selected", EditorStyles.miniBoldLabel);
+                EditorGUILayout.LabelField("Select an asset in the Project window to add it to the package.", EditorStyles.wordWrappedMiniLabel);
+            }
+            else if (selectionCount == 1)
+            {
+                EditorGUILayout.LabelField(activeObject.name, EditorStyles.miniBoldLabel);
+                EditorGUILayout.SelectableLabel(activePath, EditorStyles.textField, GUILayout.Height(EditorGUIUtility.singleLineHeight));
+            }
+            else
+            {
+                EditorGUILayout.LabelField($"{selectionCount} project assets selected", EditorStyles.miniBoldLabel);
+                EditorGUILayout.LabelField("The button will add all selected project assets.", EditorStyles.wordWrappedMiniLabel);
+            }
+
+            using (new EditorGUI.DisabledScope(editableArchive == null || !hasSelection))
+            {
+                if (GUILayout.Button(selectionCount > 1 ? "Add Selected Project Assets To Package" : "Add Selected Project Asset To Package"))
                 {
                     AddSelectedProjectAssets();
                 }
             }
 
+            EditorGUILayout.EndVertical();
             EditorGUILayout.EndHorizontal();
-        }
-
-        private void DrawToolbar()
-        {
-            EditorGUILayout.BeginHorizontal();
-            searchQuery = EditorGUILayout.TextField("Search", searchQuery);
-
-            using (new EditorGUI.DisabledScope(editableArchive == null || editableArchive.Entries.Count == 0))
-            {
-                if (GUILayout.Button("Select All Visible", GUILayout.Width(120f)))
-                {
-                    foreach (var asset in GetVisibleEntries())
-                    {
-                        selectedAssetPaths.Add(asset.OriginalAssetPath);
-                    }
-                }
-
-                if (GUILayout.Button("Clear Selection", GUILayout.Width(110f)))
-                {
-                    selectedAssetPaths.Clear();
-                }
-            }
-
-            EditorGUILayout.EndHorizontal();
-
-            if (editableArchive != null)
-            {
-                EditorGUILayout.LabelField(
-                    $"{editableArchive.Entries.Count} assets | {FormatSize(editableArchive.PackageFileSizeBytes)} source size | {selectedAssetPaths.Count} selected",
-                    EditorStyles.miniLabel);
-            }
+            EditorGUILayout.EndVertical();
         }
 
         private void DrawWideLayout()
@@ -275,7 +238,7 @@ namespace Orbiters.UnityPackageManager.Editor
         private void DrawAssetPane()
         {
             EditorGUILayout.Space();
-            EditorGUILayout.LabelField("Contents", EditorStyles.boldLabel);
+            DrawContentsToolbar();
 
             if (editableArchive == null)
             {
@@ -292,9 +255,16 @@ namespace Orbiters.UnityPackageManager.Editor
             else
             {
                 assetScrollPosition = EditorGUILayout.BeginScrollView(assetScrollPosition);
-                foreach (var entry in visibleEntries)
+                if (currentViewMode == ViewMode.List)
                 {
-                    DrawAssetRow(entry);
+                    foreach (var entry in visibleEntries)
+                    {
+                        DrawAssetRow(entry);
+                    }
+                }
+                else
+                {
+                    DrawThumbnailGrid(visibleEntries);
                 }
 
                 EditorGUILayout.EndScrollView();
@@ -302,6 +272,45 @@ namespace Orbiters.UnityPackageManager.Editor
             var dropRect = GUILayoutUtility.GetLastRect();
             HandleAddFilesDrop(dropRect);
             EditorGUILayout.EndVertical();
+        }
+
+        private void DrawContentsToolbar()
+        {
+            EditorGUILayout.BeginHorizontal();
+            EditorGUILayout.LabelField("Contents", EditorStyles.boldLabel);
+            GUILayout.FlexibleSpace();
+
+            searchQuery = EditorGUILayout.TextField(searchQuery, GUILayout.MinWidth(180f), GUILayout.MaxWidth(280f));
+
+            using (new EditorGUI.DisabledScope(editableArchive == null || editableArchive.Entries.Count == 0))
+            {
+                if (GUILayout.Button("Select All Visible", GUILayout.Width(120f)))
+                {
+                    foreach (var asset in GetVisibleEntries())
+                    {
+                        selectedAssetPaths.Add(asset.OriginalAssetPath);
+                    }
+                }
+
+                if (GUILayout.Button("Clear Selection", GUILayout.Width(110f)))
+                {
+                    selectedAssetPaths.Clear();
+                }
+            }
+
+            GUILayout.Space(8f);
+            GUILayout.Label("View", EditorStyles.miniLabel, GUILayout.Width(30f));
+            DrawViewModeToggle(ViewMode.Thumbnail, "Grid", "thumbnail view");
+            DrawViewModeToggle(ViewMode.List, "List", "list view");
+
+            EditorGUILayout.EndHorizontal();
+
+            if (editableArchive != null)
+            {
+                EditorGUILayout.LabelField(
+                    $"{editableArchive.Entries.Count} assets | {FormatSize(editableArchive.PackageFileSizeBytes)} source size | {selectedAssetPaths.Count} selected",
+                    EditorStyles.miniLabel);
+            }
         }
 
         private void DrawFolderTreePanel()
@@ -417,6 +426,72 @@ namespace Orbiters.UnityPackageManager.Editor
             }
         }
 
+        private void DrawThumbnailGrid(IReadOnlyList<EditableUnityPackageEntry> visibleEntries)
+        {
+            var availableWidth = Mathf.Max(120f, position.width - (ShouldShowFolderTree() ? FolderTreeWidth + 48f : 48f));
+            var columns = Mathf.Max(1, Mathf.FloorToInt(availableWidth / (ThumbnailTileSize + 16f)));
+            var index = 0;
+
+            while (index < visibleEntries.Count)
+            {
+                EditorGUILayout.BeginHorizontal();
+                for (var column = 0; column < columns && index < visibleEntries.Count; column++, index++)
+                {
+                    DrawThumbnailTile(visibleEntries[index]);
+                }
+
+                GUILayout.FlexibleSpace();
+                EditorGUILayout.EndHorizontal();
+            }
+        }
+
+        private void DrawThumbnailTile(EditableUnityPackageEntry entry)
+        {
+            var assetInfo = entry.ToAssetInfo();
+            var isSelected = selectedAssetPaths.Contains(entry.OriginalAssetPath);
+
+            EditorGUILayout.BeginVertical("box", GUILayout.Width(ThumbnailTileSize + 18f), GUILayout.Height(ThumbnailTileSize + 54f));
+            var previewRect = GUILayoutUtility.GetRect(ThumbnailTileSize, ThumbnailTileSize, GUILayout.Width(ThumbnailTileSize), GUILayout.Height(ThumbnailTileSize));
+            if (isSelected)
+            {
+                EditorGUI.DrawRect(new Rect(previewRect.x - 2f, previewRect.y - 2f, previewRect.width + 4f, previewRect.height + 24f), new Color(0.18f, 0.35f, 0.62f, 0.25f));
+            }
+
+            var thumbnail = GetThumbnailTexture(entry);
+            if (thumbnail != null)
+            {
+                GUI.DrawTexture(previewRect, thumbnail, ScaleMode.ScaleToFit, true);
+            }
+
+            GUILayout.Space(4f);
+            GUILayout.Label(assetInfo.AssetName, EditorStyles.miniLabel, GUILayout.Width(ThumbnailTileSize + 10f));
+            EditorGUILayout.EndVertical();
+
+            var tileRect = GUILayoutUtility.GetLastRect();
+            var currentEvent = Event.current;
+            if (tileRect.Contains(currentEvent.mousePosition) && currentEvent.type == EventType.MouseDown && currentEvent.button == 0)
+            {
+                if (!currentEvent.control && !currentEvent.command)
+                {
+                    selectedAssetPaths.Clear();
+                    selectedAssetPaths.Add(entry.OriginalAssetPath);
+                }
+                else
+                {
+                    SetSelection(entry.OriginalAssetPath, !isSelected);
+                }
+
+                Repaint();
+                currentEvent.Use();
+            }
+
+            if (tileRect.Contains(currentEvent.mousePosition) && currentEvent.type == EventType.MouseDrag && currentEvent.button == 0)
+            {
+                UnityPackageProjectDropHandler.BeginDrag(unityPackagePath, GetDragSelection(entry));
+                currentEvent.Use();
+            }
+        }
+
         private IEnumerable<UnityPackageAssetInfo> GetDragSelection(EditableUnityPackageEntry fallback)
         {
             if (!selectedAssetPaths.Contains(fallback.OriginalAssetPath))
@@ -458,6 +533,7 @@ namespace Orbiters.UnityPackageManager.Editor
                 hasUnsavedChanges = false;
                 undoStack.Clear();
                 redoStack.Clear();
+                ClearThumbnailCache();
             }
             catch (Exception exception)
             {
@@ -625,6 +701,7 @@ namespace Orbiters.UnityPackageManager.Editor
                 ReplacedEntries = replacedEntries
             });
             hasUnsavedChanges = true;
+            ClearThumbnailCache();
             Repaint();
         }
 
@@ -673,6 +750,7 @@ namespace Orbiters.UnityPackageManager.Editor
                 RemovedEntries = removedEntries
             });
             hasUnsavedChanges = true;
+            ClearThumbnailCache();
             Repaint();
         }
 
@@ -777,6 +855,7 @@ namespace Orbiters.UnityPackageManager.Editor
             selectedAssetPaths.RemoveWhere(path =>
                 editableArchive.Entries.All(entry => !string.Equals(entry.OriginalAssetPath, path, StringComparison.OrdinalIgnoreCase)));
             hasUnsavedChanges = undoStack.Count > 0;
+            ClearThumbnailCache();
             Repaint();
         }
 
@@ -980,6 +1059,186 @@ namespace Orbiters.UnityPackageManager.Editor
             return position.width >= FolderTreeThresholdWidth;
         }
 
+        private void DrawToolbarButton(string text, string tooltip, string iconName, bool enabled, Action onClick)
+        {
+            using (new EditorGUI.DisabledScope(!enabled))
+            {
+                var content = EditorGUIUtility.IconContent(iconName);
+                content.text = text;
+                content.tooltip = tooltip;
+                if (GUILayout.Button(content, EditorStyles.toolbarButton, GUILayout.Height(22f)))
+                {
+                    onClick?.Invoke();
+                }
+            }
+        }
+
+        private void DrawViewModeToggle(ViewMode mode, string label, string tooltip)
+        {
+            var selected = currentViewMode == mode;
+            if (GUILayout.Toggle(selected, new GUIContent(label, tooltip), EditorStyles.toolbarButton, GUILayout.Width(50f)) && !selected)
+            {
+                currentViewMode = mode;
+                EditorPrefs.SetInt(ViewModePrefKey, (int)mode);
+                Repaint();
+            }
+        }
+
+        private Texture2D GetThumbnailTexture(EditableUnityPackageEntry entry)
+        {
+            if (entry == null || string.IsNullOrWhiteSpace(entry.OriginalAssetPath))
+            {
+                return EditorGUIUtility.FindTexture("DefaultAsset Icon");
+            }
+
+            if (thumbnailCache.TryGetValue(entry.OriginalAssetPath, out var cached))
+            {
+                return cached.Texture;
+            }
+
+            Texture2D texture = null;
+            var ownsTexture = false;
+            if (entry.PreviewBytes != null && entry.PreviewBytes.Length > 0)
+            {
+                texture = new Texture2D(2, 2, TextureFormat.RGBA32, false)
+                {
+                    hideFlags = HideFlags.HideAndDontSave
+                };
+                ownsTexture = true;
+
+                if (!ImageConversion.LoadImage(texture, entry.PreviewBytes, true))
+                {
+                    DestroyImmediate(texture, false);
+                    texture = null;
+                    ownsTexture = false;
+                }
+            }
+
+            if (texture == null)
+            {
+                texture = TryBuildAssetThumbnail(entry, out ownsTexture) ?? GetFallbackIcon(entry);
+            }
+
+            thumbnailCache[entry.OriginalAssetPath] = new ThumbnailCacheItem
+            {
+                Texture = texture,
+                Owned = ownsTexture
+            };
+            return texture;
+        }
+
+        private Texture2D TryBuildAssetThumbnail(EditableUnityPackageEntry entry, out bool ownsTexture)
+        {
+            ownsTexture = false;
+            var extension = (entry.FileExtension ?? string.Empty).ToLowerInvariant();
+            switch (extension)
+            {
+                case ".png":
+                case ".jpg":
+                case ".jpeg":
+                case ".tga":
+                    if (entry.AssetBytes == null || entry.AssetBytes.Length == 0)
+                    {
+                        return null;
+                    }
+
+                    var imageTexture = new Texture2D(2, 2, TextureFormat.RGBA32, false)
+                    {
+                        hideFlags = HideFlags.HideAndDontSave
+                    };
+
+                    if (ImageConversion.LoadImage(imageTexture, entry.AssetBytes, true))
+                    {
+                        ownsTexture = true;
+                        return imageTexture;
+                    }
+
+                    DestroyImmediate(imageTexture, false);
+                    return null;
+                default:
+                    return null;
+            }
+        }
+
+        private Texture2D GetFallbackIcon(EditableUnityPackageEntry entry)
+        {
+            var extension = (entry.FileExtension ?? string.Empty).ToLowerInvariant();
+            switch (extension)
+            {
+                case ".prefab":
+                    return FindIconOrDefault("Prefab Icon");
+                case ".mat":
+                    return FindIconOrDefault("Material Icon");
+                case ".anim":
+                    return FindIconOrDefault("AnimationClip Icon");
+                case ".controller":
+                    return FindIconOrDefault("AnimatorController Icon");
+                case ".fbx":
+                case ".obj":
+                    return FindIconOrDefault("PrefabModel Icon");
+                case ".png":
+                case ".jpg":
+                case ".jpeg":
+                case ".tga":
+                    return FindIconOrDefault("Texture2D Icon");
+                case ".shader":
+                    return FindIconOrDefault("Shader Icon");
+                case ".cs":
+                    return FindIconOrDefault("cs Script Icon");
+                default:
+                    return FindIconOrDefault("DefaultAsset Icon");
+            }
+        }
+
+        private void ClearThumbnailCache()
+        {
+            foreach (var pair in thumbnailCache)
+            {
+                if (pair.Value.Owned && pair.Value.Texture != null)
+                {
+                    DestroyImmediate(pair.Value.Texture, false);
+                }
+            }
+
+            thumbnailCache.Clear();
+        }
+
+        private Texture2D GetProjectSelectionPreview(UnityEngine.Object activeObject, string activePath)
+        {
+            if (activeObject == null)
+            {
+                return FindIconOrDefault("DefaultAsset Icon");
+            }
+
+            var preview = AssetPreview.GetAssetPreview(activeObject);
+            if (preview != null)
+            {
+                return preview;
+            }
+
+            preview = AssetPreview.GetMiniThumbnail(activeObject);
+            if (preview != null)
+            {
+                return preview;
+            }
+
+            if (!string.IsNullOrWhiteSpace(activePath))
+            {
+                var icon = AssetDatabase.GetCachedIcon(activePath) as Texture2D;
+                if (icon != null)
+                {
+                    return icon;
+                }
+            }
+
+            return FindIconOrDefault("DefaultAsset Icon");
+        }
+
+        private Texture2D FindIconOrDefault(string iconName)
+        {
+            return EditorGUIUtility.FindTexture(iconName) ?? EditorGUIUtility.FindTexture("DefaultAsset Icon");
+        }
+
         private string GetSuggestedPackageName()
         {
             if (!string.IsNullOrWhiteSpace(loadedPackagePath))
@@ -1041,6 +1300,18 @@ namespace Orbiters.UnityPackageManager.Editor
             public string Name { get; }
             public string ProjectPath { get; }
             public List<FolderNode> Children { get; } = new List<FolderNode>();
+        }
+
+        private sealed class ThumbnailCacheItem
+        {
+            public Texture2D Texture;
+            public bool Owned;
+        }
+
+        private enum ViewMode
+        {
+            Thumbnail = 0,
+            List = 1
         }
 
         private enum PackageEditActionKind
