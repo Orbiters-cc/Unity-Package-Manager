@@ -11,6 +11,7 @@ namespace Orbiters.UnityPackageManager.Editor
     {
         private const string DefaultDestinationFolder = "Assets";
         private const float FolderTreeThresholdWidth = 1150f;
+        private const float TopPanelsHorizontalThresholdWidth = 700f;
         private const float FolderTreeWidth = 280f;
         private const string ViewModePrefKey = "Orbiters.UnityPackageManager.ViewMode";
         private const string ThumbnailSizePrefKey = "Orbiters.UnityPackageManager.ThumbnailSize";
@@ -40,6 +41,7 @@ namespace Orbiters.UnityPackageManager.Editor
         private readonly Dictionary<string, ThumbnailCacheItem> thumbnailCache = new Dictionary<string, ThumbnailCacheItem>(StringComparer.OrdinalIgnoreCase);
         private ViewMode currentViewMode = ViewMode.Thumbnail;
         private float thumbnailTileSize = 92f;
+        private string selectionAnchorPath;
 
         [MenuItem("Tools/Orbiters/UnityPackageManager")]
         private static void OpenWindow()
@@ -105,6 +107,13 @@ namespace Orbiters.UnityPackageManager.Editor
 
         private void DrawTopPanels()
         {
+            if (position.width < TopPanelsHorizontalThresholdWidth)
+            {
+                DrawPackagePicker();
+                DrawImportControls();
+                return;
+            }
+
             EditorGUILayout.BeginHorizontal();
             EditorGUILayout.BeginVertical(GUILayout.ExpandWidth(true));
             DrawPackagePicker();
@@ -407,17 +416,23 @@ namespace Orbiters.UnityPackageManager.Editor
         private void DrawAssetRow(EditableUnityPackageEntry entry)
         {
             var assetInfo = entry.ToAssetInfo();
+            var isCompactList = position.width < TopPanelsHorizontalThresholdWidth;
+            var thumbnail = GetThumbnailTexture(entry);
 
             EditorGUILayout.BeginHorizontal("box");
             var isSelected = selectedAssetPaths.Contains(entry.OriginalAssetPath);
             var toggled = EditorGUILayout.Toggle(isSelected, GUILayout.Width(18f));
             if (toggled != isSelected)
             {
-                SetSelection(entry.OriginalAssetPath, toggled);
+                HandleSelectionInteraction(entry, toggled, additive: Event.current.control || Event.current.command, range: Event.current.shift);
             }
 
+            GUILayout.Label(thumbnail, GUILayout.Width(18f), GUILayout.Height(18f));
             EditorGUILayout.LabelField(assetInfo.AssetName, GUILayout.Width(220f));
-            EditorGUILayout.LabelField(assetInfo.OriginalAssetPath, GUILayout.MinWidth(280f));
+            if (!isCompactList)
+            {
+                EditorGUILayout.LabelField(assetInfo.OriginalAssetPath, GUILayout.MinWidth(280f));
+            }
             EditorGUILayout.LabelField(FormatSize(assetInfo.AssetSizeBytes), GUILayout.Width(95f));
             EditorGUILayout.LabelField(assetInfo.FileExtension, GUILayout.Width(65f));
             EditorGUILayout.LabelField(assetInfo.HasMetaFile ? "meta" : string.Empty, GUILayout.Width(45f));
@@ -428,16 +443,7 @@ namespace Orbiters.UnityPackageManager.Editor
             var currentEvent = Event.current;
             if (rowRect.Contains(currentEvent.mousePosition) && currentEvent.type == EventType.MouseDown && currentEvent.button == 0)
             {
-                if (!currentEvent.control && !currentEvent.command)
-                {
-                    selectedAssetPaths.Clear();
-                    selectedAssetPaths.Add(entry.OriginalAssetPath);
-                }
-                else
-                {
-                    SetSelection(entry.OriginalAssetPath, !isSelected);
-                }
-
+                HandleSelectionInteraction(entry, !isSelected || !currentEvent.control && !currentEvent.command, currentEvent.control || currentEvent.command, currentEvent.shift);
                 Repaint();
                 currentEvent.Use();
             }
@@ -494,16 +500,7 @@ namespace Orbiters.UnityPackageManager.Editor
             var currentEvent = Event.current;
             if (tileRect.Contains(currentEvent.mousePosition) && currentEvent.type == EventType.MouseDown && currentEvent.button == 0)
             {
-                if (!currentEvent.control && !currentEvent.command)
-                {
-                    selectedAssetPaths.Clear();
-                    selectedAssetPaths.Add(entry.OriginalAssetPath);
-                }
-                else
-                {
-                    SetSelection(entry.OriginalAssetPath, !isSelected);
-                }
-
+                HandleSelectionInteraction(entry, !isSelected || !currentEvent.control && !currentEvent.command, currentEvent.control || currentEvent.command, currentEvent.shift);
                 Repaint();
                 currentEvent.Use();
             }
@@ -525,6 +522,57 @@ namespace Orbiters.UnityPackageManager.Editor
             return editableArchive.Entries
                 .Where(entry => selectedAssetPaths.Contains(entry.OriginalAssetPath))
                 .Select(entry => entry.ToAssetInfo());
+        }
+
+        private void HandleSelectionInteraction(EditableUnityPackageEntry entry, bool requestedSelectedState, bool additive, bool range)
+        {
+            if (editableArchive == null || entry == null)
+            {
+                return;
+            }
+
+            var visibleEntries = GetVisibleEntries().ToList();
+            var clickedPath = entry.OriginalAssetPath;
+
+            if (range && !string.IsNullOrWhiteSpace(selectionAnchorPath))
+            {
+                if (!additive)
+                {
+                    selectedAssetPaths.Clear();
+                }
+
+                var anchorIndex = visibleEntries.FindIndex(item =>
+                    string.Equals(item.OriginalAssetPath, selectionAnchorPath, StringComparison.OrdinalIgnoreCase));
+                var clickedIndex = visibleEntries.FindIndex(item =>
+                    string.Equals(item.OriginalAssetPath, clickedPath, StringComparison.OrdinalIgnoreCase));
+
+                if (anchorIndex >= 0 && clickedIndex >= 0)
+                {
+                    var start = Math.Min(anchorIndex, clickedIndex);
+                    var end = Math.Max(anchorIndex, clickedIndex);
+                    for (var i = start; i <= end; i++)
+                    {
+                        selectedAssetPaths.Add(visibleEntries[i].OriginalAssetPath);
+                    }
+                }
+                else
+                {
+                    SetSelection(clickedPath, true);
+                }
+            }
+            else if (additive)
+            {
+                SetSelection(clickedPath, requestedSelectedState);
+                selectionAnchorPath = clickedPath;
+                return;
+            }
+            else
+            {
+                selectedAssetPaths.Clear();
+                SetSelection(clickedPath, true);
+            }
+
+            selectionAnchorPath = clickedPath;
         }
 
         private IEnumerable<EditableUnityPackageEntry> GetVisibleEntries()
