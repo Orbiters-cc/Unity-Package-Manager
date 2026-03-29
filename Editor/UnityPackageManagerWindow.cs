@@ -91,6 +91,7 @@ namespace Orbiters.UnityPackageManager.Editor
             GUILayout.Space(4f);
             DrawToolbarButton("Add Files", "Add files into the package", "Toolbar Plus", editableArchive != null, AddFilesFromDialog);
             DrawToolbarButton("Remove", "Remove selected package entries", "Toolbar Minus", editableArchive != null && selectedAssetPaths.Count > 0, RemoveSelectedEntries);
+            DrawToolbarButton("Copy Hierarchy", "Copy the package file hierarchy to the clipboard", "Clipboard", editableArchive != null && editableArchive.Entries.Count > 0, CopyHierarchyToClipboard);
             GUILayout.Space(4f);
             DrawToolbarButton("Undo", "Undo last package edit", null, editableArchive != null && undoStack.Count > 0, UndoLastEdit);
             DrawToolbarButton("Redo", "Redo last undone package edit", null, editableArchive != null && redoStack.Count > 0, RedoLastEdit);
@@ -960,6 +961,21 @@ namespace Orbiters.UnityPackageManager.Editor
             ClearThumbnailCache();
             FocusWindowForKeyboardShortcuts();
             Repaint();
+        }
+
+        private void CopyHierarchyToClipboard()
+        {
+            if (editableArchive == null || editableArchive.Entries.Count == 0)
+            {
+                return;
+            }
+
+            var lines = editableArchive.Entries
+                .OrderBy(entry => entry.OriginalAssetPath, StringComparer.OrdinalIgnoreCase)
+                .Select(entry => "- " + entry.OriginalAssetPath);
+
+            EditorGUIUtility.systemCopyBuffer = string.Join("\n", lines);
+            FocusWindowForKeyboardShortcuts();
         }
 
         private void HandleUndoRedoShortcuts()
