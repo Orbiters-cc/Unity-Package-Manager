@@ -322,7 +322,7 @@ namespace Orbiters.UnityPackageManager.Editor
 
             GUILayout.Space(8f);
             GUILayout.Label("Size", EditorStyles.miniLabel, GUILayout.Width(28f));
-            var nextSize = GUILayout.HorizontalSlider(thumbnailTileSize, 56f, 160f, GUILayout.Width(90f));
+            var nextSize = GUILayout.HorizontalSlider(thumbnailTileSize, 18f, 160f, GUILayout.Width(90f));
             if (!Mathf.Approximately(nextSize, thumbnailTileSize))
             {
                 thumbnailTileSize = nextSize;
@@ -418,27 +418,54 @@ namespace Orbiters.UnityPackageManager.Editor
             var assetInfo = entry.ToAssetInfo();
             var isCompactList = position.width < TopPanelsHorizontalThresholdWidth;
             var thumbnail = GetThumbnailTexture(entry);
-
-            EditorGUILayout.BeginHorizontal("box");
             var isSelected = selectedAssetPaths.Contains(entry.OriginalAssetPath);
-            var toggled = EditorGUILayout.Toggle(isSelected, GUILayout.Width(18f));
+            var thumbSize = GetListThumbnailSize();
+            var rowHeight = Mathf.Max(EditorGUIUtility.singleLineHeight + 6f, thumbSize + 6f);
+            var rowRect = EditorGUILayout.GetControlRect(false, rowHeight + 4f);
+            GUI.Box(rowRect, GUIContent.none, EditorStyles.helpBox);
+
+            var contentRect = new Rect(rowRect.x + 6f, rowRect.y + 2f, rowRect.width - 12f, rowHeight);
+            var toggleRect = new Rect(contentRect.x, contentRect.y + (contentRect.height - 18f) * 0.5f, 18f, 18f);
+            var thumbnailRect = new Rect(toggleRect.xMax + 6f, contentRect.y + (contentRect.height - thumbSize) * 0.5f, thumbSize, thumbSize);
+            var x = thumbnailRect.xMax + 8f;
+
+            var toggled = GUI.Toggle(toggleRect, isSelected, GUIContent.none);
             if (toggled != isSelected)
             {
                 HandleSelectionInteraction(entry, toggled, additive: Event.current.control || Event.current.command, range: Event.current.shift);
             }
 
-            GUILayout.Label(thumbnail, GUILayout.Width(18f), GUILayout.Height(18f));
-            EditorGUILayout.LabelField(assetInfo.AssetName, GUILayout.Width(220f));
+            if (thumbnail != null)
+            {
+                GUI.DrawTexture(thumbnailRect, thumbnail, ScaleMode.ScaleToFit, true);
+            }
+
+            var nameRect = new Rect(x, contentRect.y, 220f, contentRect.height);
+            GUI.Label(nameRect, assetInfo.AssetName, EditorStyles.label);
+            x = nameRect.xMax + 6f;
+
             if (!isCompactList)
             {
-                EditorGUILayout.LabelField(assetInfo.OriginalAssetPath, GUILayout.MinWidth(280f));
+                var pathWidth = Mathf.Max(120f, contentRect.xMax - x - 95f - 65f - 45f - 55f - 24f);
+                var pathRect = new Rect(x, contentRect.y, pathWidth, contentRect.height);
+                GUI.Label(pathRect, assetInfo.OriginalAssetPath, EditorStyles.label);
+                x = pathRect.xMax + 6f;
             }
-            EditorGUILayout.LabelField(FormatSize(assetInfo.AssetSizeBytes), GUILayout.Width(95f));
-            EditorGUILayout.LabelField(assetInfo.FileExtension, GUILayout.Width(65f));
-            EditorGUILayout.LabelField(assetInfo.HasMetaFile ? "meta" : string.Empty, GUILayout.Width(45f));
-            EditorGUILayout.LabelField(assetInfo.HasPreviewImage ? "preview" : string.Empty, GUILayout.Width(55f));
-            EditorGUILayout.EndHorizontal();
-            var rowRect = GUILayoutUtility.GetLastRect();
+
+            var sizeRect = new Rect(x, contentRect.y, 95f, contentRect.height);
+            GUI.Label(sizeRect, FormatSize(assetInfo.AssetSizeBytes), EditorStyles.label);
+            x = sizeRect.xMax + 6f;
+
+            var extRect = new Rect(x, contentRect.y, 65f, contentRect.height);
+            GUI.Label(extRect, assetInfo.FileExtension, EditorStyles.label);
+            x = extRect.xMax + 6f;
+
+            var metaRect = new Rect(x, contentRect.y, 45f, contentRect.height);
+            GUI.Label(metaRect, assetInfo.HasMetaFile ? "meta" : string.Empty, EditorStyles.label);
+            x = metaRect.xMax + 6f;
+
+            var previewRect = new Rect(x, contentRect.y, 55f, contentRect.height);
+            GUI.Label(previewRect, assetInfo.HasPreviewImage ? "preview" : string.Empty, EditorStyles.label);
 
             var currentEvent = Event.current;
             if (rowRect.Contains(currentEvent.mousePosition) && currentEvent.type == EventType.MouseDown && currentEvent.button == 0)
@@ -458,7 +485,8 @@ namespace Orbiters.UnityPackageManager.Editor
         private void DrawThumbnailGrid(IReadOnlyList<EditableUnityPackageEntry> visibleEntries)
         {
             var availableWidth = Mathf.Max(120f, position.width - (ShouldShowFolderTree() ? FolderTreeWidth + 48f : 48f));
-            var columns = Mathf.Max(1, Mathf.FloorToInt(availableWidth / (thumbnailTileSize + 16f)));
+            var gridThumbnailSize = GetGridThumbnailSize();
+            var columns = Mathf.Max(1, Mathf.FloorToInt(availableWidth / (gridThumbnailSize + 16f)));
             var index = 0;
 
             while (index < visibleEntries.Count)
@@ -478,9 +506,10 @@ namespace Orbiters.UnityPackageManager.Editor
         {
             var assetInfo = entry.ToAssetInfo();
             var isSelected = selectedAssetPaths.Contains(entry.OriginalAssetPath);
+            var gridThumbnailSize = GetGridThumbnailSize();
 
-            EditorGUILayout.BeginVertical("box", GUILayout.Width(thumbnailTileSize + 18f), GUILayout.Height(thumbnailTileSize + 54f));
-            var previewRect = GUILayoutUtility.GetRect(thumbnailTileSize, thumbnailTileSize, GUILayout.Width(thumbnailTileSize), GUILayout.Height(thumbnailTileSize));
+            EditorGUILayout.BeginVertical("box", GUILayout.Width(gridThumbnailSize + 18f), GUILayout.Height(gridThumbnailSize + 54f));
+            var previewRect = GUILayoutUtility.GetRect(gridThumbnailSize, gridThumbnailSize, GUILayout.Width(gridThumbnailSize), GUILayout.Height(gridThumbnailSize));
             if (isSelected)
             {
                 EditorGUI.DrawRect(new Rect(previewRect.x - 2f, previewRect.y - 2f, previewRect.width + 4f, previewRect.height + 24f), new Color(0.18f, 0.35f, 0.62f, 0.25f));
@@ -493,7 +522,7 @@ namespace Orbiters.UnityPackageManager.Editor
             }
 
             GUILayout.Space(4f);
-            GUILayout.Label(assetInfo.AssetName, EditorStyles.miniLabel, GUILayout.Width(thumbnailTileSize + 10f));
+            GUILayout.Label(assetInfo.AssetName, EditorStyles.miniLabel, GUILayout.Width(gridThumbnailSize + 10f));
             EditorGUILayout.EndVertical();
 
             var tileRect = GUILayoutUtility.GetLastRect();
@@ -1381,6 +1410,16 @@ namespace Orbiters.UnityPackageManager.Editor
                    ?? EditorGUIUtility.FindTexture(iconName)
                    ?? (EditorGUIUtility.IconContent("DefaultAsset Icon").image as Texture2D)
                    ?? EditorGUIUtility.FindTexture("DefaultAsset Icon");
+        }
+
+        private float GetListThumbnailSize()
+        {
+            return Mathf.Clamp(thumbnailTileSize, 18f, 56f);
+        }
+
+        private float GetGridThumbnailSize()
+        {
+            return Mathf.Max(GetListThumbnailSize() * 2f, thumbnailTileSize);
         }
 
         private void FocusWindowForKeyboardShortcuts()
