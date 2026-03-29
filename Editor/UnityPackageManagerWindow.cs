@@ -33,6 +33,8 @@ namespace Orbiters.UnityPackageManager.Editor
         private EditableUnityPackageArchive editableArchive;
         private FolderNode folderTreeRoot;
         private bool folderTreeDirty = true;
+        private readonly Stack<PackageEditAction> undoStack = new Stack<PackageEditAction>();
+        private readonly Stack<PackageEditAction> redoStack = new Stack<PackageEditAction>();
 
         [MenuItem("Tools/Orbiters/UnityPackageManager")]
         private static void OpenWindow()
@@ -55,6 +57,7 @@ namespace Orbiters.UnityPackageManager.Editor
 
         private void OnGUI()
         {
+            HandleUndoRedoShortcuts();
             DrawHeader();
             DrawPackagePicker();
             DrawSaveControls();
@@ -151,9 +154,31 @@ namespace Orbiters.UnityPackageManager.Editor
                 {
                     RemoveSelectedEntries();
                 }
+
+                using (new EditorGUI.DisabledScope(undoStack.Count == 0))
+                {
+                    if (GUILayout.Button("Undo", GUILayout.Width(70f)))
+                    {
+                        UndoLastEdit();
+                    }
+                }
+
+                using (new EditorGUI.DisabledScope(redoStack.Count == 0))
+                {
+                    if (GUILayout.Button("Redo", GUILayout.Width(70f)))
+                    {
+                        RedoLastEdit();
+                    }
+                }
             }
 
             EditorGUILayout.EndHorizontal();
+            if (editableArchive != null)
+            {
+                EditorGUILayout.LabelField(
+                    $"Undo: {undoStack.Count} | Redo: {redoStack.Count}",
+                    EditorStyles.miniLabel);
+            }
             EditorGUILayout.EndVertical();
         }
 
@@ -258,11 +283,7 @@ namespace Orbiters.UnityPackageManager.Editor
                 return;
             }
 
-            var listRect = GUILayoutUtility.GetRect(10f, 100000f, 200f, 100000f);
-            GUI.Box(listRect, GUIContent.none);
-            HandleAddFilesDrop(listRect);
-
-            GUILayout.BeginArea(new Rect(listRect.x + 4f, listRect.y + 4f, listRect.width - 8f, listRect.height - 8f));
+            EditorGUILayout.BeginVertical("box", GUILayout.ExpandHeight(true));
             var visibleEntries = GetVisibleEntries().ToArray();
             if (visibleEntries.Length == 0)
             {
@@ -278,8 +299,9 @@ namespace Orbiters.UnityPackageManager.Editor
 
                 EditorGUILayout.EndScrollView();
             }
-
-            GUILayout.EndArea();
+            var dropRect = GUILayoutUtility.GetLastRect();
+            HandleAddFilesDrop(dropRect);
+            EditorGUILayout.EndVertical();
         }
 
         private void DrawFolderTreePanel()
@@ -434,6 +456,8 @@ namespace Orbiters.UnityPackageManager.Editor
                 unityPackagePath = editableArchive.PackageFilePath;
                 selectedAssetPaths.Clear();
                 hasUnsavedChanges = false;
+                undoStack.Clear();
+                redoStack.Clear();
             }
             catch (Exception exception)
             {
@@ -514,6 +538,8 @@ namespace Orbiters.UnityPackageManager.Editor
                 unityPackagePath = outputPath;
                 loadedPackagePath = outputPath;
                 hasUnsavedChanges = false;
+                undoStack.Clear();
+                redoStack.Clear();
                 editableArchive.PackageFilePath = outputPath;
                 editableArchive.PackageFileSizeBytes = new FileInfo(outputPath).Length;
                 editableArchive.LastWriteTimeUtc = File.GetLastWriteTimeUtc(outputPath);
@@ -562,19 +588,42 @@ namespace Orbiters.UnityPackageManager.Editor
                 return;
             }
 
+            var addedEntries = new List<EditableUnityPackageEntry>();
+            var replacedEntries = new List<EditableUnityPackageEntry>();
             foreach (var sourcePath in ExpandSourcePaths(sourcePaths))
             {
                 var entry = archiveService.CreateEntryFromFile(sourcePath);
+                var replaced = editableArchive.Entries
+                    .Where(existing => string.Equals(existing.OriginalAssetPath, entry.OriginalAssetPath, StringComparison.OrdinalIgnoreCase))
+                    .Select(existing => existing.Clone())
+                    .ToArray();
+                if (replaced.Length > 0)
+                {
+                    replacedEntries.AddRange(replaced);
+                }
+
                 editableArchive.Entries.RemoveAll(existing =>
                     string.Equals(existing.OriginalAssetPath, entry.OriginalAssetPath, StringComparison.OrdinalIgnoreCase));
                 editableArchive.Entries.Add(entry);
                 selectedAssetPaths.Add(entry.OriginalAssetPath);
+                addedEntries.Add(entry.Clone());
+            }
+
+            if (addedEntries.Count == 0)
+            {
+                return;
             }
 
             editableArchive.Entries = editableArchive.Entries
                 .OrderBy(entry => entry.OriginalAssetPath, StringComparer.OrdinalIgnoreCase)
                 .ToList();
 
+            PushUndoAction(new PackageEditAction
+            {
+                Kind = PackageEditActionKind.Add,
+                AddedEntries = addedEntries,
+                ReplacedEntries = replacedEntries
+            });
             hasUnsavedChanges = true;
             Repaint();
         }
@@ -611,10 +660,150 @@ namespace Orbiters.UnityPackageManager.Editor
                 return;
             }
 
+            var removedEntries = editableArchive.Entries
+                .Where(entry => selectedAssetPaths.Contains(entry.OriginalAssetPath))
+                .Select(entry => entry.Clone())
+                .ToList();
+
             editableArchive.Entries.RemoveAll(entry => selectedAssetPaths.Contains(entry.OriginalAssetPath));
             selectedAssetPaths.Clear();
+            PushUndoAction(new PackageEditAction
+            {
+                Kind = PackageEditActionKind.Remove,
+                RemovedEntries = removedEntries
+            });
             hasUnsavedChanges = true;
             Repaint();
+        }
+
+        private void UndoLastEdit()
+        {
+            if (editableArchive == null || undoStack.Count == 0)
+            {
+                return;
+            }
+
+            var action = undoStack.Pop();
+            ApplyUndo(action);
+            redoStack.Push(action.Clone());
+            NormalizeEntries();
+        }
+
+        private void RedoLastEdit()
+        {
+            if (editableArchive == null || redoStack.Count == 0)
+            {
+                return;
+            }
+
+            var action = redoStack.Pop();
+            ApplyRedo(action);
+            undoStack.Push(action.Clone());
+            NormalizeEntries();
+        }
+
+        private void ApplyUndo(PackageEditAction action)
+        {
+            switch (action.Kind)
+            {
+                case PackageEditActionKind.Add:
+                    foreach (var added in action.AddedEntries)
+                    {
+                        editableArchive.Entries.RemoveAll(entry =>
+                            string.Equals(entry.OriginalAssetPath, added.OriginalAssetPath, StringComparison.OrdinalIgnoreCase));
+                    }
+
+                    foreach (var replaced in action.ReplacedEntries)
+                    {
+                        editableArchive.Entries.RemoveAll(entry =>
+                            string.Equals(entry.OriginalAssetPath, replaced.OriginalAssetPath, StringComparison.OrdinalIgnoreCase));
+                        editableArchive.Entries.Add(replaced.Clone());
+                    }
+
+                    break;
+                case PackageEditActionKind.Remove:
+                    foreach (var removed in action.RemovedEntries)
+                    {
+                        editableArchive.Entries.RemoveAll(entry =>
+                            string.Equals(entry.OriginalAssetPath, removed.OriginalAssetPath, StringComparison.OrdinalIgnoreCase));
+                        editableArchive.Entries.Add(removed.Clone());
+                    }
+
+                    break;
+            }
+        }
+
+        private void ApplyRedo(PackageEditAction action)
+        {
+            switch (action.Kind)
+            {
+                case PackageEditActionKind.Add:
+                    foreach (var replaced in action.ReplacedEntries)
+                    {
+                        editableArchive.Entries.RemoveAll(entry =>
+                            string.Equals(entry.OriginalAssetPath, replaced.OriginalAssetPath, StringComparison.OrdinalIgnoreCase));
+                    }
+
+                    foreach (var added in action.AddedEntries)
+                    {
+                        editableArchive.Entries.RemoveAll(entry =>
+                            string.Equals(entry.OriginalAssetPath, added.OriginalAssetPath, StringComparison.OrdinalIgnoreCase));
+                        editableArchive.Entries.Add(added.Clone());
+                    }
+
+                    break;
+                case PackageEditActionKind.Remove:
+                    foreach (var removed in action.RemovedEntries)
+                    {
+                        editableArchive.Entries.RemoveAll(entry =>
+                            string.Equals(entry.OriginalAssetPath, removed.OriginalAssetPath, StringComparison.OrdinalIgnoreCase));
+                    }
+
+                    break;
+            }
+        }
+
+        private void PushUndoAction(PackageEditAction action)
+        {
+            undoStack.Push(action.Clone());
+            redoStack.Clear();
+        }
+
+        private void NormalizeEntries()
+        {
+            editableArchive.Entries = editableArchive.Entries
+                .OrderBy(entry => entry.OriginalAssetPath, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+            selectedAssetPaths.RemoveWhere(path =>
+                editableArchive.Entries.All(entry => !string.Equals(entry.OriginalAssetPath, path, StringComparison.OrdinalIgnoreCase)));
+            hasUnsavedChanges = undoStack.Count > 0;
+            Repaint();
+        }
+
+        private void HandleUndoRedoShortcuts()
+        {
+            var currentEvent = Event.current;
+            if (currentEvent.type != EventType.KeyDown)
+            {
+                return;
+            }
+
+            var actionKey = currentEvent.control || currentEvent.command;
+            if (!actionKey)
+            {
+                return;
+            }
+
+            if (currentEvent.keyCode == KeyCode.Z)
+            {
+                UndoLastEdit();
+                currentEvent.Use();
+            }
+            else if (currentEvent.keyCode == KeyCode.Y)
+            {
+                RedoLastEdit();
+                currentEvent.Use();
+            }
         }
 
         private void HandlePackageFileDrop(Rect fieldRect)
@@ -852,6 +1041,31 @@ namespace Orbiters.UnityPackageManager.Editor
             public string Name { get; }
             public string ProjectPath { get; }
             public List<FolderNode> Children { get; } = new List<FolderNode>();
+        }
+
+        private enum PackageEditActionKind
+        {
+            Add,
+            Remove
+        }
+
+        private sealed class PackageEditAction
+        {
+            public PackageEditActionKind Kind;
+            public List<EditableUnityPackageEntry> AddedEntries = new List<EditableUnityPackageEntry>();
+            public List<EditableUnityPackageEntry> RemovedEntries = new List<EditableUnityPackageEntry>();
+            public List<EditableUnityPackageEntry> ReplacedEntries = new List<EditableUnityPackageEntry>();
+
+            public PackageEditAction Clone()
+            {
+                return new PackageEditAction
+                {
+                    Kind = Kind,
+                    AddedEntries = AddedEntries.Select(entry => entry.Clone()).ToList(),
+                    RemovedEntries = RemovedEntries.Select(entry => entry.Clone()).ToList(),
+                    ReplacedEntries = ReplacedEntries.Select(entry => entry.Clone()).ToList()
+                };
+            }
         }
     }
 }

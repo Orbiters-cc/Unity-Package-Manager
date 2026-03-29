@@ -446,6 +446,30 @@ namespace Orbiters.UnityPackageManager.Editor
                 HasPreviewImage = PreviewBytes != null && PreviewBytes.Length > 0
             };
         }
+
+        public EditableUnityPackageEntry Clone()
+        {
+            return new EditableUnityPackageEntry
+            {
+                PackageGuid = PackageGuid,
+                OriginalAssetPath = OriginalAssetPath,
+                AssetBytes = CloneBytes(AssetBytes),
+                MetaBytes = CloneBytes(MetaBytes),
+                PreviewBytes = CloneBytes(PreviewBytes)
+            };
+        }
+
+        private static byte[] CloneBytes(byte[] bytes)
+        {
+            if (bytes == null)
+            {
+                return null;
+            }
+
+            var clone = new byte[bytes.Length];
+            Buffer.BlockCopy(bytes, 0, clone, 0, bytes.Length);
+            return clone;
+        }
     }
 
     internal static class TarArchiveReader
