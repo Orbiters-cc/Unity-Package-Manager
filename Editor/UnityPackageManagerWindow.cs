@@ -30,7 +30,7 @@ namespace Orbiters.UnityPackageManager.Editor
         private string destinationFolder = DefaultDestinationFolder;
         private bool preservePackageHierarchy = true;
         private bool overwriteExistingFiles;
-        private bool hasUnsavedChanges;
+        private new bool hasUnsavedChanges;
         private Vector2 assetScrollPosition;
         private Vector2 folderTreeScrollPosition;
         private EditableUnityPackageArchive editableArchive;
