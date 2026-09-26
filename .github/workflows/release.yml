@@ -2,11 +2,75 @@ name: Build Release
 
 on: 
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths: [package.json]
+
+concurrency:
+  group: build-release
+  cancel-in-progress: false
 
 jobs:
+  release-check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      should_release: ${{ steps.check.outputs.should_release }}
+    steps:
+      - name: Checkout release history
+        uses: actions/checkout@3df4ab11eba7bda6032a0b82a6bb43b11571feac
+        with:
+          fetch-depth: 0
+      - name: Check package version change
+        id: check
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+          from pathlib import Path
+
+          def git(*args):
+              return subprocess.check_output(["git", *args], text=True).strip()
+
+          def decide():
+              if os.environ["EVENT_NAME"] == "workflow_dispatch":
+                  return True, "Manual release requested."
+              before = os.environ["BEFORE_SHA"]
+              if not before or set(before) == {"0"}:
+                  return False, "No previous branch revision to compare."
+              if subprocess.run(["git", "cat-file", "-e", f"{before}^{{commit}}"],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode:
+                  subprocess.run(["git", "fetch", "--no-tags", "origin", before], check=True)
+              previous = json.loads(git("show", f"{before}:package.json"))["version"]
+              current = json.loads(Path("package.json").read_text(encoding="utf-8"))["version"]
+              if not isinstance(current, str) or not current:
+                  raise ValueError("package.json version must be a nonempty string")
+              subprocess.run(["git", "check-ref-format", f"refs/tags/{current}"], check=True)
+              if current == previous:
+                  return False, f"Package version is unchanged ({current})."
+              if subprocess.run(["git", "show-ref", "--verify", "--quiet",
+                                 f"refs/tags/{current}"]).returncode == 0:
+                  return False, f"Version {current} already has a tag; use a new version or a manual release."
+              return True, f"Package version changed from {previous} to {current}."
+
+          should_release, reason = decide()
+          print(reason)
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"should_release={str(should_release).lower()}\n")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+              summary.write(reason + "\n")
+          PY
+
 
   # Validate Repository Configuration
   config:
+    needs: release-check
+    if: needs.release-check.outputs.should_release == 'true'
     runs-on: ubuntu-latest
     outputs:
       config_package: ${{ steps.config_package.outputs.configPackage }}
