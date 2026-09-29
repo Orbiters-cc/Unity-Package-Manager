@@ -32,6 +32,7 @@ Dragging from the tool window into the Project window imports the selected files
 
 - If a file already exists and overwrite is disabled, UnityPackageManager generates a unique asset path.
 - If `Preserve Package Hierarchy` is enabled for button import, the original package folder layout is preserved under the destination folder.
+- Entries whose package path would land outside the destination folder (for example through `..`) are never written; UnityPackageManager lists them after the import.
 
 ## API
 

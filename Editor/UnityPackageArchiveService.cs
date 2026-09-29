@@ -22,12 +22,25 @@ namespace Orbiters.UnityPackageManager.Editor
 
     internal sealed class UnityPackageArchiveService : IUnityPackageReader, IUnityPackageExtractor
     {
+        // What reading a package may cost, as in Orbiters Toolkit's UnityPackageIndex: a small crafted file can declare
+        // or expand to far more than it holds, and everything read here stays in memory.
+        internal const int MaxEntries = 200000;
+        internal const int MaxPathnameBytes = 4096;
+        internal const long MaxExpandedBytes = 8L * 1024 * 1024 * 1024;
+
+        private static readonly char[] InvalidFileNameChars = Path.GetInvalidFileNameChars();
+
         public UnityPackageArchiveInfo ReadArchive(string unityPackageFilePath)
         {
             return ReadEditableArchive(unityPackageFilePath).ToArchiveInfo();
         }
 
         public EditableUnityPackageArchive ReadEditableArchive(string unityPackageFilePath)
+        {
+            return ReadEditableArchive(unityPackageFilePath, MaxExpandedBytes, MaxEntries);
+        }
+
+        internal EditableUnityPackageArchive ReadEditableArchive(string unityPackageFilePath, long maxExpandedBytes, int maxEntries)
         {
             var fullPath = ValidateUnityPackageFile(unityPackageFilePath);
             var fileInfo = new FileInfo(fullPath);
@@ -36,7 +49,7 @@ namespace Orbiters.UnityPackageManager.Editor
             using (var fileStream = File.OpenRead(fullPath))
             using (var gzipStream = new GZipStream(fileStream, CompressionMode.Decompress))
             {
-                TarArchiveReader.IterateEntries(gzipStream, (entryName, size, dataStream) =>
+                TarArchiveReader.IterateEntries(gzipStream, fileInfo.Name, maxExpandedBytes, maxEntries, (entryName, size, dataStream) =>
                 {
                     var packageGuid = TarArchiveReader.GetTopLevelDirectory(entryName);
                     if (string.IsNullOrEmpty(packageGuid))
@@ -54,7 +67,13 @@ namespace Orbiters.UnityPackageManager.Editor
                     switch (TarArchiveReader.GetEntrySuffix(entryName))
                     {
                         case "pathname":
-                            entry.OriginalAssetPath = NormalizeArchivePath(TarArchiveReader.ReadUtf8String(dataStream, size));
+                            if (size > MaxPathnameBytes)
+                            {
+                                throw new InvalidDataException(fileInfo.Name + " has an invalid entry name.");
+                            }
+
+                            // Some exporters add a second line after the path; Unity reads the first one.
+                            entry.OriginalAssetPath = NormalizeArchivePath(TarArchiveReader.ReadUtf8String(dataStream, size).Split('\n')[0].Trim());
                             break;
                         case "asset":
                             entry.AssetBytes = TarArchiveReader.ReadBytes(dataStream, size);
@@ -92,12 +111,24 @@ namespace Orbiters.UnityPackageManager.Editor
             string destinationFolderPath,
             UnityPackageImportOptions options)
         {
-            var fullPath = ValidateUnityPackageFile(unityPackageFilePath);
-            var normalizedDestinationFolder = NormalizeProjectPath(destinationFolderPath, requireExistingFolder: false);
-            EnsureDirectoryExists(normalizedDestinationFolder);
+            var outputPaths = ExtractAssets(unityPackageFilePath, originalAssetPaths, destinationFolderPath, options, out var refusedPaths);
+            if (refusedPaths.Count > 0)
+            {
+                Debug.LogWarning("UnityPackageManager: " + DescribeRefusedEntries(refusedPaths, destinationFolderPath));
+            }
 
-            var resolvedOptions = options ?? new UnityPackageImportOptions();
-            var editableArchive = ReadEditableArchive(fullPath);
+            return outputPaths;
+        }
+
+        internal IReadOnlyList<string> ExtractAssets(
+            string unityPackageFilePath,
+            IEnumerable<string> originalAssetPaths,
+            string destinationFolderPath,
+            UnityPackageImportOptions options,
+            out IReadOnlyList<string> refusedPaths)
+        {
+            var fullPath = ValidateUnityPackageFile(unityPackageFilePath);
+            refusedPaths = Array.Empty<string>();
             var selectedPaths = new HashSet<string>(
                 (originalAssetPaths ?? Array.Empty<string>())
                 .Where(path => !string.IsNullOrWhiteSpace(path))
@@ -109,34 +140,75 @@ namespace Orbiters.UnityPackageManager.Editor
                 return Array.Empty<string>();
             }
 
-            var selectedEntries = editableArchive.Entries
+            var selectedEntries = ReadEditableArchive(fullPath).Entries
                 .Where(entry => selectedPaths.Contains(entry.OriginalAssetPath))
                 .ToList();
 
-            if (selectedEntries.Count == 0)
-            {
-                return Array.Empty<string>();
-            }
+            return selectedEntries.Count == 0
+                ? Array.Empty<string>()
+                : ExtractEntries(selectedEntries, destinationFolderPath, options, out refusedPaths);
+        }
 
-            var outputPaths = new List<string>(selectedEntries.Count);
-            foreach (var entry in selectedEntries)
+        /// <summary>
+        /// Writes entries under the destination folder. An entry whose pathname would land outside that folder is not
+        /// written; its package path is returned in <paramref name="refusedPaths"/>.
+        /// </summary>
+        internal IReadOnlyList<string> ExtractEntries(
+            IEnumerable<EditableUnityPackageEntry> entries,
+            string destinationFolderPath,
+            UnityPackageImportOptions options,
+            out IReadOnlyList<string> refusedPaths)
+        {
+            var destinationFolder = NormalizeProjectPath(destinationFolderPath, requireExistingFolder: false);
+            var destinationRoot = ProjectRelativeToAbsolute(destinationFolder);
+            Directory.CreateDirectory(destinationRoot);
+
+            var resolvedOptions = options ?? new UnityPackageImportOptions();
+            var refused = new List<string>();
+            var outputPaths = new List<string>();
+            // Path order puts a folder record before its contents, so its .meta is written before files create the folder.
+            foreach (var entry in (entries ?? Enumerable.Empty<EditableUnityPackageEntry>())
+                         .Where(entry => entry != null)
+                         .OrderBy(entry => entry.OriginalAssetPath, StringComparer.OrdinalIgnoreCase))
             {
                 var relativePath = resolvedOptions.PreservePackageHierarchy
                     ? GetRelativeImportPath(entry.OriginalAssetPath)
                     : entry.AssetName;
 
-                var destinationAssetPath = CombineProjectPath(normalizedDestinationFolder, relativePath);
-                if (!resolvedOptions.OverwriteExistingFiles)
+                var destinationAssetPath = IsSafeRelativePath(relativePath)
+                    ? CombineProjectPath(destinationFolder, relativePath)
+                    : null;
+                if (destinationAssetPath != null && !entry.IsFolder && !resolvedOptions.OverwriteExistingFiles)
                 {
-                    destinationAssetPath = AssetDatabase.GenerateUniqueAssetPath(destinationAssetPath);
+                    destinationAssetPath = GenerateUniqueProjectPath(destinationAssetPath);
                 }
 
-                outputPaths.Add(destinationAssetPath);
-                WriteEntryToProject(entry, destinationAssetPath);
+                if (destinationAssetPath == null ||
+                    !TryGetContainedPath(destinationRoot, ProjectRelativeToAbsolute(destinationAssetPath), out var pathInDestination) ||
+                    pathInDestination.Length == 0)
+                {
+                    refused.Add(entry.OriginalAssetPath);
+                    continue;
+                }
+
+                if (WriteEntryToProject(entry, destinationAssetPath, resolvedOptions.OverwriteExistingFiles))
+                {
+                    outputPaths.Add(destinationAssetPath);
+                }
             }
 
+            refusedPaths = refused;
             AssetDatabase.Refresh();
             return outputPaths;
+        }
+
+        internal static string DescribeRefusedEntries(IReadOnlyCollection<string> refusedPaths, string destinationFolder)
+        {
+            const int listed = 10;
+            var lines = refusedPaths.Take(listed).Select(path => "- " + path);
+            var more = refusedPaths.Count > listed ? $"\n...and {refusedPaths.Count - listed} more" : string.Empty;
+            return $"Skipped {refusedPaths.Count} package {(refusedPaths.Count == 1 ? "entry" : "entries")} whose path would be written outside {destinationFolder}:\n" +
+                   string.Join("\n", lines) + more;
         }
 
         public EditableUnityPackageEntry CreateEntryFromFile(string sourcePath)
@@ -157,14 +229,7 @@ namespace Orbiters.UnityPackageManager.Editor
                 throw new InvalidOperationException("Meta files should not be added directly.");
             }
 
-            var projectRoot = Path.GetFullPath(Path.Combine(Application.dataPath, ".."));
-            var normalizedSource = fullPath.Replace('\\', '/');
-            var normalizedProjectRoot = projectRoot.Replace('\\', '/');
-            var isInsideProject = normalizedSource.StartsWith(normalizedProjectRoot, StringComparison.OrdinalIgnoreCase);
-            var originalAssetPath = isInsideProject
-                ? normalizedSource.Substring(normalizedProjectRoot.Length).TrimStart('/')
-                : "Assets/" + Path.GetFileName(fullPath);
-
+            var originalAssetPath = GetArchivePathForFile(GetProjectRoot(), fullPath);
             var metaPath = fullPath + ".meta";
             byte[] metaBytes = null;
             string packageGuid = null;
@@ -203,16 +268,29 @@ namespace Orbiters.UnityPackageManager.Editor
                 throw new InvalidOperationException("Output file must use the .unitypackage extension.");
             }
 
+            // Folder records have no asset payload, only their pathname and .meta: they are kept too.
+            var filteredEntries = (entries ?? Enumerable.Empty<EditableUnityPackageEntry>())
+                .Where(entry => entry != null && !string.IsNullOrWhiteSpace(entry.OriginalAssetPath))
+                .OrderBy(entry => entry.OriginalAssetPath, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            // Records are keyed by GUID: a second record with the same GUID would replace the first when read back.
+            var sharedGuid = filteredEntries
+                .Where(entry => !string.IsNullOrWhiteSpace(entry.PackageGuid))
+                .GroupBy(entry => entry.PackageGuid, StringComparer.OrdinalIgnoreCase)
+                .FirstOrDefault(group => group.Count() > 1);
+            if (sharedGuid != null)
+            {
+                throw new InvalidOperationException(
+                    $"These entries share the GUID {sharedGuid.Key}, so only one of them would survive in the package. Remove all but one before saving:\n" +
+                    string.Join("\n", sharedGuid.Select(entry => "- " + entry.OriginalAssetPath)));
+            }
+
             var outputDirectory = Path.GetDirectoryName(fullOutputPath);
             if (!string.IsNullOrEmpty(outputDirectory))
             {
                 Directory.CreateDirectory(outputDirectory);
             }
-
-            var filteredEntries = (entries ?? Enumerable.Empty<EditableUnityPackageEntry>())
-                .Where(entry => entry != null && !string.IsNullOrWhiteSpace(entry.OriginalAssetPath) && entry.AssetBytes != null)
-                .OrderBy(entry => entry.OriginalAssetPath, StringComparer.OrdinalIgnoreCase)
-                .ToList();
 
             using (var fileStream = File.Create(fullOutputPath))
             using (var gzipStream = new GZipStream(fileStream, (CompressionLevel)CompressionLevel.Optimal))
@@ -224,7 +302,10 @@ namespace Orbiters.UnityPackageManager.Editor
                         : entry.PackageGuid;
 
                     TarArchiveWriter.WriteFile(gzipStream, packageGuid + "/pathname", Encoding.UTF8.GetBytes(NormalizeArchivePath(entry.OriginalAssetPath)));
-                    TarArchiveWriter.WriteFile(gzipStream, packageGuid + "/asset", entry.AssetBytes);
+                    if (!entry.IsFolder)
+                    {
+                        TarArchiveWriter.WriteFile(gzipStream, packageGuid + "/asset", entry.AssetBytes);
+                    }
 
                     if (entry.MetaBytes != null && entry.MetaBytes.Length > 0)
                     {
@@ -262,24 +343,34 @@ namespace Orbiters.UnityPackageManager.Editor
             return Path.GetFileName(normalized);
         }
 
-        private static void WriteEntryToProject(EditableUnityPackageEntry entry, string destinationAssetPath)
+        private static bool WriteEntryToProject(EditableUnityPackageEntry entry, string destinationAssetPath, bool overwrite)
         {
-            WriteBytesToProjectFile(destinationAssetPath, entry.AssetBytes);
+            var absolutePath = ProjectRelativeToAbsolute(destinationAssetPath);
+            if (entry.IsFolder)
+            {
+                // An existing folder keeps its own .meta (and GUID) unless overwriting.
+                if (Directory.Exists(absolutePath) && !overwrite)
+                {
+                    return false;
+                }
+
+                Directory.CreateDirectory(absolutePath);
+            }
+            else
+            {
+                WriteBytesToFile(absolutePath, entry.AssetBytes);
+            }
 
             if (entry.MetaBytes != null && entry.MetaBytes.Length > 0)
             {
-                WriteBytesToProjectFile(destinationAssetPath + ".meta", entry.MetaBytes);
+                WriteBytesToFile(absolutePath + ".meta", entry.MetaBytes);
             }
+
+            return true;
         }
 
-        private static void WriteBytesToProjectFile(string projectRelativePath, byte[] bytes)
+        private static void WriteBytesToFile(string absolutePath, byte[] bytes)
         {
-            if (bytes == null)
-            {
-                return;
-            }
-
-            var absolutePath = ProjectRelativeToAbsolute(projectRelativePath);
             var directory = Path.GetDirectoryName(absolutePath);
             if (!string.IsNullOrEmpty(directory))
             {
@@ -287,6 +378,86 @@ namespace Orbiters.UnityPackageManager.Editor
             }
 
             File.WriteAllBytes(absolutePath, bytes);
+        }
+
+        // Checked on disk: files written earlier in the same import are not in the AssetDatabase yet, and Unity's
+        // GenerateUniqueAssetPath returns nothing for a folder it does not know.
+        private static string GenerateUniqueProjectPath(string projectRelativePath)
+        {
+            if (!ProjectPathExists(projectRelativePath))
+            {
+                return projectRelativePath;
+            }
+
+            var directory = Path.GetDirectoryName(projectRelativePath)?.Replace('\\', '/');
+            var name = Path.GetFileNameWithoutExtension(projectRelativePath);
+            var extension = Path.GetExtension(projectRelativePath);
+            for (var index = 1; ; index++)
+            {
+                var candidate = $"{directory}/{name} {index}{extension}";
+                if (!ProjectPathExists(candidate))
+                {
+                    return candidate;
+                }
+            }
+        }
+
+        private static bool ProjectPathExists(string projectRelativePath)
+        {
+            var absolutePath = ProjectRelativeToAbsolute(projectRelativePath);
+            return File.Exists(absolutePath) || Directory.Exists(absolutePath);
+        }
+
+        // A pathname may only name something below the destination: nothing rooted, no "." or "..", and no character
+        // Windows reads as a drive, stream or device separator.
+        private static bool IsSafeRelativePath(string relativePath)
+        {
+            return !string.IsNullOrEmpty(relativePath) &&
+                   !Path.IsPathRooted(relativePath) &&
+                   relativePath.Split('/').All(segment =>
+                       segment.Length > 0 && segment != "." && segment != ".." && segment.IndexOfAny(InvalidFileNameChars) < 0);
+        }
+
+        /// <summary>
+        /// Path of <paramref name="path"/> below <paramref name="root"/>, both canonicalized. Whole folder names are
+        /// compared, so "MCB Test Backup" is not inside "MCB Test".
+        /// </summary>
+        internal static bool TryGetContainedPath(string root, string path, out string relativePath)
+        {
+            relativePath = null;
+            string normalizedRoot;
+            string normalizedPath;
+            try
+            {
+                normalizedRoot = Path.GetFullPath(root).Replace('\\', '/').TrimEnd('/');
+                normalizedPath = Path.GetFullPath(path).Replace('\\', '/').TrimEnd('/');
+            }
+            catch (Exception exception) when (exception is ArgumentException || exception is NotSupportedException || exception is PathTooLongException)
+            {
+                return false;
+            }
+
+            if (string.Equals(normalizedPath, normalizedRoot, StringComparison.OrdinalIgnoreCase))
+            {
+                relativePath = string.Empty;
+                return true;
+            }
+
+            if (!normalizedPath.StartsWith(normalizedRoot + "/", StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            relativePath = normalizedPath.Substring(normalizedRoot.Length + 1);
+            return true;
+        }
+
+        // Files inside the project keep their project path; any other file goes directly under Assets/.
+        internal static string GetArchivePathForFile(string projectRoot, string fullPath)
+        {
+            return TryGetContainedPath(projectRoot, fullPath, out var projectPath) && projectPath.Length > 0
+                ? projectPath
+                : "Assets/" + Path.GetFileName(fullPath);
         }
 
         private static string ExtractGuidFromMeta(byte[] metaBytes)
@@ -346,21 +517,17 @@ namespace Orbiters.UnityPackageManager.Editor
                 throw new ArgumentException("A destination folder path is required.", nameof(projectPath));
             }
 
-            var normalized = projectPath.Replace('\\', '/').Trim();
-            if (Path.IsPathRooted(normalized))
+            var projectRoot = GetProjectRoot();
+            var trimmed = projectPath.Replace('\\', '/').Trim();
+            var absolute = Path.IsPathRooted(trimmed) ? trimmed : Path.Combine(projectRoot, trimmed);
+            if (!TryGetContainedPath(projectRoot, absolute, out var normalized))
             {
-                var projectRoot = Path.GetFullPath(Path.Combine(Application.dataPath, "..")).Replace('\\', '/');
-                var absolute = Path.GetFullPath(normalized).Replace('\\', '/');
-                if (!absolute.StartsWith(projectRoot, StringComparison.OrdinalIgnoreCase))
-                {
-                    throw new InvalidOperationException("Destination must be inside the current Unity project.");
-                }
-
-                normalized = absolute.Substring(projectRoot.Length).TrimStart('/');
+                throw new InvalidOperationException("Destination must be inside the current Unity project.");
             }
 
-            if (!normalized.StartsWith("Assets", StringComparison.OrdinalIgnoreCase) &&
-                !normalized.StartsWith("Packages", StringComparison.OrdinalIgnoreCase))
+            var topFolder = normalized.Split('/')[0];
+            if (!string.Equals(topFolder, "Assets", StringComparison.OrdinalIgnoreCase) &&
+                !string.Equals(topFolder, "Packages", StringComparison.OrdinalIgnoreCase))
             {
                 throw new InvalidOperationException("Destination must be under Assets or Packages.");
             }
@@ -378,15 +545,14 @@ namespace Orbiters.UnityPackageManager.Editor
             return (path ?? string.Empty).Replace('\\', '/').TrimStart('/');
         }
 
-        private static void EnsureDirectoryExists(string projectRelativeFolder)
+        private static string GetProjectRoot()
         {
-            Directory.CreateDirectory(ProjectRelativeToAbsolute(projectRelativeFolder));
+            return Path.GetFullPath(Path.Combine(Application.dataPath, ".."));
         }
 
         private static string ProjectRelativeToAbsolute(string projectRelativePath)
         {
-            var projectRoot = Path.GetFullPath(Path.Combine(Application.dataPath, ".."));
-            return Path.GetFullPath(Path.Combine(projectRoot, projectRelativePath.Replace('/', Path.DirectorySeparatorChar)));
+            return Path.GetFullPath(Path.Combine(GetProjectRoot(), projectRelativePath.Replace('/', Path.DirectorySeparatorChar)));
         }
 
         private static string CombineProjectPath(string folderPath, string relativePath)
@@ -401,6 +567,15 @@ namespace Orbiters.UnityPackageManager.Editor
         public long PackageFileSizeBytes;
         public DateTime LastWriteTimeUtc;
         public List<EditableUnityPackageEntry> Entries = new List<EditableUnityPackageEntry>();
+
+        /// <summary>Adds the entry in place of the entries for the same asset, which it returns.</summary>
+        public List<EditableUnityPackageEntry> AddOrReplace(EditableUnityPackageEntry entry)
+        {
+            var replaced = Entries.Where(existing => existing.IsSameAsset(entry)).ToList();
+            Entries.RemoveAll(replaced.Contains);
+            Entries.Add(entry);
+            return replaced;
+        }
 
         public UnityPackageArchiveInfo ToArchiveInfo()
         {
@@ -428,6 +603,17 @@ namespace Orbiters.UnityPackageManager.Editor
         public string AssetName => Path.GetFileName(OriginalAssetPath ?? string.Empty);
         public string DirectoryPath => Path.GetDirectoryName(OriginalAssetPath ?? string.Empty)?.Replace('\\', '/') ?? string.Empty;
         public string FileExtension => Path.GetExtension(AssetName);
+
+        /// <summary>Folder records carry a pathname and a .meta but no asset payload.</summary>
+        public bool IsFolder => AssetBytes == null;
+
+        /// <summary>Same path, or same GUID: an asset moved in the project keeps its GUID.</summary>
+        public bool IsSameAsset(EditableUnityPackageEntry other)
+        {
+            return other != null &&
+                   (string.Equals(OriginalAssetPath, other.OriginalAssetPath, StringComparison.OrdinalIgnoreCase) ||
+                    !string.IsNullOrWhiteSpace(PackageGuid) && string.Equals(PackageGuid, other.PackageGuid, StringComparison.OrdinalIgnoreCase));
+        }
 
         public UnityPackageAssetInfo ToAssetInfo()
         {
@@ -476,15 +662,24 @@ namespace Orbiters.UnityPackageManager.Editor
     {
         private const int TarBlockSize = 512;
 
-        public static void IterateEntries(Stream stream, Action<string, long, Stream> handler)
+        private const int InitialReadBufferBytes = 1024 * 1024;
+
+        public static void IterateEntries(Stream stream, string archiveName, long maxExpandedBytes, int maxEntries, Action<string, long, Stream> handler)
         {
             var header = new byte[TarBlockSize];
+            long expandedBytes = 0;
+            var entryCount = 0;
 
             while (ReadExactly(stream, header, TarBlockSize))
             {
                 if (IsAllZeros(header))
                 {
                     break;
+                }
+
+                if (++entryCount > maxEntries)
+                {
+                    throw new InvalidDataException(archiveName + " has too many entries to be a Unity package.");
                 }
 
                 var entryName = ReadTarString(header, 0, 100);
@@ -494,7 +689,13 @@ namespace Orbiters.UnityPackageManager.Editor
                     entryName = prefix + "/" + entryName;
                 }
 
-                var size = ReadOctal(header, 124, 12);
+                var size = ReadSize(header, archiveName);
+                expandedBytes += TarBlockSize + size;
+                if (expandedBytes > maxExpandedBytes)
+                {
+                    throw new InvalidDataException(archiveName + " expands beyond the size limit for a package.");
+                }
+
                 handler(entryName, size, stream);
                 SkipPadding(stream, size);
             }
@@ -531,15 +732,32 @@ namespace Orbiters.UnityPackageManager.Editor
             return Encoding.UTF8.GetString(ReadBytes(stream, size)).TrimEnd('\0', '\r', '\n');
         }
 
+        // The buffer grows with the bytes actually read: a header can declare far more than the archive holds.
         public static byte[] ReadBytes(Stream stream, long size)
         {
             if (size > int.MaxValue)
             {
-                throw new InvalidOperationException("Archive entry is too large to read into memory.");
+                throw new InvalidDataException("Archive entry is too large to read into memory.");
             }
 
-            var buffer = new byte[(int)size];
-            CopyExactly(stream, buffer, size);
+            var buffer = new byte[Math.Min(size, InitialReadBufferBytes)];
+            var offset = 0;
+            while (offset < size)
+            {
+                if (offset == buffer.Length)
+                {
+                    Array.Resize(ref buffer, (int)Math.Min(size, buffer.LongLength * 2));
+                }
+
+                var read = stream.Read(buffer, offset, buffer.Length - offset);
+                if (read <= 0)
+                {
+                    throw new EndOfStreamException("Unexpected end of archive stream.");
+                }
+
+                offset += read;
+            }
+
             return buffer;
         }
 
@@ -563,24 +781,6 @@ namespace Orbiters.UnityPackageManager.Editor
                 }
 
                 output.Write(buffer, 0, read);
-                remaining -= read;
-            }
-        }
-
-        public static void CopyExactly(Stream input, byte[] output, long size)
-        {
-            var remaining = (int)size;
-            var offset = 0;
-
-            while (remaining > 0)
-            {
-                var read = input.Read(output, offset, remaining);
-                if (read <= 0)
-                {
-                    throw new EndOfStreamException("Unexpected end of archive stream.");
-                }
-
-                offset += read;
                 remaining -= read;
             }
         }
@@ -636,15 +836,26 @@ namespace Orbiters.UnityPackageManager.Editor
             return Encoding.ASCII.GetString(buffer, offset, length).Trim('\0', ' ');
         }
 
-        private static long ReadOctal(byte[] buffer, int offset, int length)
+        // Octal digits only (the POSIX field); the GNU base-256 form marks sizes no Unity package needs.
+        private static long ReadSize(byte[] header, string archiveName)
         {
-            var value = ReadTarString(buffer, offset, length);
-            if (string.IsNullOrWhiteSpace(value))
+            if ((header[124] & 0x80) != 0)
             {
-                return 0;
+                throw new InvalidDataException(archiveName + " declares an entry too large for a package.");
             }
 
-            return Convert.ToInt64(value, 8);
+            long size = 0;
+            foreach (var digit in ReadTarString(header, 124, 12))
+            {
+                if (digit < '0' || digit > '7')
+                {
+                    throw new InvalidDataException(archiveName + " is not a valid Unity package.");
+                }
+
+                size = size * 8 + (digit - '0');
+            }
+
+            return size;
         }
     }
 

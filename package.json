@@ -1,7 +1,7 @@
 {
   "name": "orbiters.unitypackagemanager",
   "displayName": "UnityPackageManager",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "unity": "2022.3",
   "description": "Inspect .unitypackage archives, browse and edit their contents, and import selected assets anywhere in the project.",
   "type": "tool",

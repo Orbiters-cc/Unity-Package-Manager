@@ -1,0 +1,21 @@
+{
+  "name": "orbiters.unitypackagemanager.Editor.Tests",
+  "references": [
+    "orbiters.unitypackagemanager",
+    "orbiters.unitypackagemanager.Editor"
+  ],
+  "includePlatforms": [
+    "Editor"
+  ],
+  "excludePlatforms": [],
+  "allowUnsafeCode": false,
+  "overrideReferences": false,
+  "precompiledReferences": [],
+  "autoReferenced": false,
+  "defineConstraints": [],
+  "versionDefines": [],
+  "noEngineReferences": false,
+  "optionalUnityReferences": [
+    "TestAssemblies"
+  ]
+}

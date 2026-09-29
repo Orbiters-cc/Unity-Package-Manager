@@ -48,7 +48,7 @@ namespace Orbiters.UnityPackageManager.Editor
             if (currentEvent.type == EventType.DragPerform)
             {
                 DragAndDrop.AcceptDrag();
-                UnityPackageManagerApi.ExtractAssets(
+                new UnityPackageArchiveService().ExtractAssets(
                     payload.UnityPackagePath,
                     payload.AssetPaths,
                     targetFolder,
@@ -56,8 +56,14 @@ namespace Orbiters.UnityPackageManager.Editor
                     {
                         PreservePackageHierarchy = false,
                         OverwriteExistingFiles = false
-                    });
+                    },
+                    out var refusedPaths);
                 DragAndDrop.SetGenericData(DragPayloadKey, null);
+                if (refusedPaths.Count > 0)
+                {
+                    EditorUtility.DisplayDialog("UnityPackageManager", UnityPackageArchiveService.DescribeRefusedEntries(refusedPaths, targetFolder), "OK");
+                }
+
                 onDrop?.Invoke(targetFolder);
             }
 

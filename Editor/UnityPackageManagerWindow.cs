@@ -30,7 +30,6 @@ namespace Orbiters.UnityPackageManager.Editor
         private string destinationFolder = DefaultDestinationFolder;
         private bool preservePackageHierarchy = true;
         private bool overwriteExistingFiles;
-        private new bool hasUnsavedChanges;
         private Vector2 assetScrollPosition;
         private Vector2 folderTreeScrollPosition;
         private EditableUnityPackageArchive editableArchive;
@@ -56,6 +55,7 @@ namespace Orbiters.UnityPackageManager.Editor
         {
             currentViewMode = (ViewMode)EditorPrefs.GetInt(ViewModePrefKey, (int)ViewMode.Thumbnail);
             thumbnailTileSize = EditorPrefs.GetFloat(ThumbnailSizePrefKey, 92f);
+            UpdateSaveChangesMessage();
             EditorApplication.projectChanged += MarkFolderTreeDirty;
         }
 
@@ -63,6 +63,15 @@ namespace Orbiters.UnityPackageManager.Editor
         {
             EditorApplication.projectChanged -= MarkFolderTreeDirty;
             ClearThumbnailCache();
+        }
+
+        // Unity calls this from its close prompt; a failed or cancelled save keeps the window open.
+        public override void SaveChanges()
+        {
+            if (SaveArchive(false, confirm: false))
+            {
+                base.SaveChanges();
+            }
         }
 
         private void OnGUI()
@@ -144,7 +153,7 @@ namespace Orbiters.UnityPackageManager.Editor
 
             if (GUI.Button(loadRect, "Load"))
             {
-                LoadArchive();
+                LoadArchive(unityPackagePath);
             }
 
             if (GUI.Button(browseRect, "Browse..."))
@@ -152,8 +161,7 @@ namespace Orbiters.UnityPackageManager.Editor
                 var picked = EditorUtility.OpenFilePanel("Open .unitypackage", GetInitialDirectory(), "unitypackage");
                 if (!string.IsNullOrEmpty(picked))
                 {
-                    unityPackagePath = picked;
-                    LoadArchive();
+                    LoadArchive(picked);
                 }
             }
 
@@ -623,24 +631,70 @@ namespace Orbiters.UnityPackageManager.Editor
                 entry.DirectoryPath.IndexOf(searchQuery, StringComparison.OrdinalIgnoreCase) >= 0);
         }
 
-        private void LoadArchive()
+        private void LoadArchive(string packagePath)
         {
+            EditableUnityPackageArchive archive;
             try
             {
-                editableArchive = archiveService.ReadEditableArchive(unityPackagePath);
-                loadedPackagePath = editableArchive.PackageFilePath;
-                unityPackagePath = editableArchive.PackageFilePath;
-                selectedAssetPaths.Clear();
-                hasUnsavedChanges = false;
-                undoStack.Clear();
-                redoStack.Clear();
-                ClearThumbnailCache();
+                archive = archiveService.ReadEditableArchive(packagePath);
             }
             catch (Exception exception)
             {
+                unityPackagePath = packagePath;
                 Debug.LogException(exception);
                 EditorUtility.DisplayDialog("UnityPackageManager", exception.Message, "OK");
+                return;
             }
+
+            // Asked once the new package is readable, so a failed load never costs the current edits.
+            if (!ConfirmReplacingUnsavedChanges())
+            {
+                return;
+            }
+
+            // Saving from the prompt may just have rewritten this very file.
+            if (File.GetLastWriteTimeUtc(archive.PackageFilePath) != archive.LastWriteTimeUtc)
+            {
+                LoadArchive(packagePath);
+                return;
+            }
+
+            editableArchive = archive;
+            loadedPackagePath = archive.PackageFilePath;
+            unityPackagePath = archive.PackageFilePath;
+            selectedAssetPaths.Clear();
+            hasUnsavedChanges = false;
+            undoStack.Clear();
+            redoStack.Clear();
+            ClearThumbnailCache();
+            UpdateSaveChangesMessage();
+        }
+
+        // Loading replaces the edited package: ask the way Unity asks when the window closes with unsaved changes.
+        private bool ConfirmReplacingUnsavedChanges()
+        {
+            if (!hasUnsavedChanges)
+            {
+                return true;
+            }
+
+            switch (EditorUtility.DisplayDialogComplex(titleContent.text + " - Unsaved Changes Detected", saveChangesMessage, "Save", "Cancel", "Discard"))
+            {
+                case 0:
+                    SaveChanges();
+                    return !hasUnsavedChanges;
+                case 2:
+                    DiscardChanges();
+                    return true;
+                default:
+                    return false;
+            }
+        }
+
+        private void UpdateSaveChangesMessage()
+        {
+            var packageName = string.IsNullOrWhiteSpace(loadedPackagePath) ? "This package" : Path.GetFileName(loadedPackagePath);
+            saveChangesMessage = $"{packageName} has unsaved changes. Do you want to save them?";
         }
 
         private void ImportSelected()
@@ -659,20 +713,27 @@ namespace Orbiters.UnityPackageManager.Editor
 
             try
             {
-                var tempPath = SaveToTemporaryArchive();
-                var imported = UnityPackageManagerApi.ExtractAssets(
-                    tempPath,
-                    selectedAssetPaths,
+                var selectedEntries = editableArchive.Entries
+                    .Where(entry => selectedAssetPaths.Contains(entry.OriginalAssetPath))
+                    .ToList();
+                var imported = archiveService.ExtractEntries(
+                    selectedEntries,
                     destinationFolder,
                     new UnityPackageImportOptions
                     {
                         PreservePackageHierarchy = preservePackageHierarchy,
                         OverwriteExistingFiles = overwriteExistingFiles
-                    });
+                    },
+                    out var refusedPaths);
 
-                File.Delete(tempPath);
-
-                if (imported.Count > 0)
+                if (refusedPaths.Count > 0)
+                {
+                    EditorUtility.DisplayDialog(
+                        "UnityPackageManager",
+                        $"Imported {imported.Count} assets.\n\n" + UnityPackageArchiveService.DescribeRefusedEntries(refusedPaths, destinationFolder),
+                        "OK");
+                }
+                else if (imported.Count > 0)
                 {
                     EditorUtility.DisplayDialog("UnityPackageManager", $"Imported {imported.Count} assets.", "OK");
                 }
@@ -684,18 +745,11 @@ namespace Orbiters.UnityPackageManager.Editor
             }
         }
 
-        private string SaveToTemporaryArchive()
-        {
-            var tempPath = Path.Combine(Path.GetTempPath(), "orbiters-upm-" + Guid.NewGuid().ToString("N") + ".unitypackage");
-            archiveService.SaveArchive(tempPath, editableArchive.Entries);
-            return tempPath;
-        }
-
-        private void SaveArchive(bool saveAs)
+        private bool SaveArchive(bool saveAs, bool confirm = true)
         {
             if (editableArchive == null)
             {
-                return;
+                return false;
             }
 
             try
@@ -708,7 +762,7 @@ namespace Orbiters.UnityPackageManager.Editor
 
                 if (string.IsNullOrWhiteSpace(outputPath))
                 {
-                    return;
+                    return false;
                 }
 
                 archiveService.SaveArchive(outputPath, editableArchive.Entries);
@@ -720,12 +774,19 @@ namespace Orbiters.UnityPackageManager.Editor
                 editableArchive.PackageFilePath = outputPath;
                 editableArchive.PackageFileSizeBytes = new FileInfo(outputPath).Length;
                 editableArchive.LastWriteTimeUtc = File.GetLastWriteTimeUtc(outputPath);
-                EditorUtility.DisplayDialog("UnityPackageManager", "Package saved.", "OK");
+                UpdateSaveChangesMessage();
+                if (confirm)
+                {
+                    EditorUtility.DisplayDialog("UnityPackageManager", "Package saved.", "OK");
+                }
+
+                return true;
             }
             catch (Exception exception)
             {
                 Debug.LogException(exception);
                 EditorUtility.DisplayDialog("UnityPackageManager", exception.Message, "OK");
+                return false;
             }
         }
 
@@ -770,20 +831,18 @@ namespace Orbiters.UnityPackageManager.Editor
             foreach (var sourcePath in ExpandSourcePaths(sourcePaths))
             {
                 var entry = archiveService.CreateEntryFromFile(sourcePath);
-                var replaced = editableArchive.Entries
-                    .Where(existing => string.Equals(existing.OriginalAssetPath, entry.OriginalAssetPath, StringComparison.OrdinalIgnoreCase))
-                    .Select(existing => existing.Clone())
-                    .ToArray();
-                if (replaced.Length > 0)
+                foreach (var replaced in editableArchive.AddOrReplace(entry))
                 {
-                    replacedEntries.AddRange(replaced);
+                    selectedAssetPaths.Remove(replaced.OriginalAssetPath);
+                    // An entry added earlier in this batch is just superseded; Undo restores only what the package had.
+                    if (!addedEntries.Remove(replaced))
+                    {
+                        replacedEntries.Add(replaced);
+                    }
                 }
 
-                editableArchive.Entries.RemoveAll(existing =>
-                    string.Equals(existing.OriginalAssetPath, entry.OriginalAssetPath, StringComparison.OrdinalIgnoreCase));
-                editableArchive.Entries.Add(entry);
                 selectedAssetPaths.Add(entry.OriginalAssetPath);
-                addedEntries.Add(entry.Clone());
+                addedEntries.Add(entry);
             }
 
             if (addedEntries.Count == 0)
@@ -1072,11 +1131,13 @@ namespace Orbiters.UnityPackageManager.Editor
             if (currentEvent.type == EventType.DragPerform)
             {
                 DragAndDrop.AcceptDrag();
-                unityPackagePath = droppedPath;
-
                 if (droppedPath.EndsWith(".unitypackage", StringComparison.OrdinalIgnoreCase))
                 {
-                    LoadArchive();
+                    LoadArchive(droppedPath);
+                }
+                else
+                {
+                    unityPackagePath = droppedPath;
                 }
             }
 
@@ -1348,6 +1409,11 @@ namespace Orbiters.UnityPackageManager.Editor
 
         private Texture2D GetFallbackIcon(EditableUnityPackageEntry entry)
         {
+            if (entry.IsFolder)
+            {
+                return FindIconOrDefault("Folder Icon");
+            }
+
             var extension = (entry.FileExtension ?? string.Empty).ToLowerInvariant();
             switch (extension)
             {
