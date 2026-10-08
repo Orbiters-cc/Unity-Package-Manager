@@ -9,3 +9,5 @@
 *.sln
 *.user
 *.tmp
+__pycache__/
+__pycache__.meta
