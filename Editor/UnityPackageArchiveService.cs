@@ -4,6 +4,7 @@ using System.IO;
 using System.IO.Compression;
 using System.Linq;
 using System.Text;
+using Orbiters.Toolkit.Editor;
 using UnityEditor;
 using UnityEngine;
 using CompressionLevel = System.IO.Compression.CompressionLevel;
@@ -22,11 +23,11 @@ namespace Orbiters.UnityPackageManager.Editor
 
     internal sealed class UnityPackageArchiveService : IUnityPackageReader, IUnityPackageExtractor
     {
-        // What reading a package may cost, as in Orbiters Toolkit's UnityPackageIndex: a small crafted file can declare
-        // or expand to far more than it holds, and everything read here stays in memory.
-        internal const int MaxEntries = 200000;
-        internal const int MaxPathnameBytes = 4096;
-        internal const long MaxExpandedBytes = 8L * 1024 * 1024 * 1024;
+        // What reading a package may cost: a small crafted file can declare or expand to far more than it holds, and
+        // everything read here stays in memory. Orbiters Toolkit's reader checks the archive itself.
+        internal const int MaxEntries = UnityPackageReader.DefaultMaxEntries;
+        internal const int MaxPathnameBytes = UnityPackageIndex.MaxPathnameBytes;
+        internal const long MaxExpandedBytes = UnityPackageReader.DefaultMaxExpandedBytes;
 
         private static readonly char[] InvalidFileNameChars = Path.GetInvalidFileNameChars();
 
@@ -46,50 +47,32 @@ namespace Orbiters.UnityPackageManager.Editor
             var fileInfo = new FileInfo(fullPath);
             var entryByGuid = new Dictionary<string, EditableUnityPackageEntry>(StringComparer.OrdinalIgnoreCase);
 
-            using (var fileStream = File.OpenRead(fullPath))
-            using (var gzipStream = new GZipStream(fileStream, CompressionMode.Decompress))
+            // Unity's importer reads a pathname's first line: some exporters write more after it.
+            var options = new UnityPackageReader.Options { MaxExpandedBytes = maxExpandedBytes, MaxEntries = maxEntries, FirstLinePathname = true };
+            UnityPackageReader.Read(fullPath, options, record =>
             {
-                TarArchiveReader.IterateEntries(gzipStream, fileInfo.Name, maxExpandedBytes, maxEntries, (entryName, size, dataStream) =>
+                if (!entryByGuid.TryGetValue(record.Guid, out var entry))
                 {
-                    var packageGuid = TarArchiveReader.GetTopLevelDirectory(entryName);
-                    if (string.IsNullOrEmpty(packageGuid))
-                    {
-                        TarArchiveReader.Skip(dataStream, size);
-                        return;
-                    }
+                    entry = new EditableUnityPackageEntry { PackageGuid = record.Guid };
+                    entryByGuid.Add(record.Guid, entry);
+                }
 
-                    if (!entryByGuid.TryGetValue(packageGuid, out var entry))
-                    {
-                        entry = new EditableUnityPackageEntry { PackageGuid = packageGuid };
-                        entryByGuid.Add(packageGuid, entry);
-                    }
-
-                    switch (TarArchiveReader.GetEntrySuffix(entryName))
-                    {
-                        case "pathname":
-                            if (size > MaxPathnameBytes)
-                            {
-                                throw new InvalidDataException(fileInfo.Name + " has an invalid entry name.");
-                            }
-
-                            // Some exporters add a second line after the path; Unity reads the first one.
-                            entry.OriginalAssetPath = NormalizeArchivePath(TarArchiveReader.ReadUtf8String(dataStream, size).Split('\n')[0].Trim());
-                            break;
-                        case "asset":
-                            entry.AssetBytes = TarArchiveReader.ReadBytes(dataStream, size);
-                            break;
-                        case "asset.meta":
-                            entry.MetaBytes = TarArchiveReader.ReadBytes(dataStream, size);
-                            break;
-                        case "preview.png":
-                            entry.PreviewBytes = TarArchiveReader.ReadBytes(dataStream, size);
-                            break;
-                        default:
-                            TarArchiveReader.Skip(dataStream, size);
-                            break;
-                    }
-                });
-            }
+                switch (record.Part)
+                {
+                    case UnityPackageReader.Part.Pathname:
+                        entry.OriginalAssetPath = NormalizeArchivePath(record.Pathname.Trim());
+                        break;
+                    case UnityPackageReader.Part.Asset:
+                        entry.AssetBytes = record.ReadAll();
+                        break;
+                    case UnityPackageReader.Part.Meta:
+                        entry.MetaBytes = record.ReadAll();
+                        break;
+                    case UnityPackageReader.Part.Preview:
+                        entry.PreviewBytes = record.ReadAll();
+                        break;
+                }
+            });
 
             var entries = entryByGuid.Values
                 .Where(entry => !string.IsNullOrWhiteSpace(entry.OriginalAssetPath))
@@ -655,207 +638,6 @@ namespace Orbiters.UnityPackageManager.Editor
             var clone = new byte[bytes.Length];
             Buffer.BlockCopy(bytes, 0, clone, 0, bytes.Length);
             return clone;
-        }
-    }
-
-    internal static class TarArchiveReader
-    {
-        private const int TarBlockSize = 512;
-
-        private const int InitialReadBufferBytes = 1024 * 1024;
-
-        public static void IterateEntries(Stream stream, string archiveName, long maxExpandedBytes, int maxEntries, Action<string, long, Stream> handler)
-        {
-            var header = new byte[TarBlockSize];
-            long expandedBytes = 0;
-            var entryCount = 0;
-
-            while (ReadExactly(stream, header, TarBlockSize))
-            {
-                if (IsAllZeros(header))
-                {
-                    break;
-                }
-
-                if (++entryCount > maxEntries)
-                {
-                    throw new InvalidDataException(archiveName + " has too many entries to be a Unity package.");
-                }
-
-                var entryName = ReadTarString(header, 0, 100);
-                var prefix = ReadTarString(header, 345, 155);
-                if (!string.IsNullOrEmpty(prefix))
-                {
-                    entryName = prefix + "/" + entryName;
-                }
-
-                var size = ReadSize(header, archiveName);
-                expandedBytes += TarBlockSize + size;
-                if (expandedBytes > maxExpandedBytes)
-                {
-                    throw new InvalidDataException(archiveName + " expands beyond the size limit for a package.");
-                }
-
-                handler(entryName, size, stream);
-                SkipPadding(stream, size);
-            }
-        }
-
-        public static string GetTopLevelDirectory(string entryName)
-        {
-            if (string.IsNullOrWhiteSpace(entryName))
-            {
-                return null;
-            }
-
-            var normalized = entryName.Replace('\\', '/');
-            var slashIndex = normalized.IndexOf('/');
-            return slashIndex > 0 ? normalized.Substring(0, slashIndex) : null;
-        }
-
-        public static string GetEntrySuffix(string entryName)
-        {
-            if (string.IsNullOrWhiteSpace(entryName))
-            {
-                return null;
-            }
-
-            var normalized = entryName.Replace('\\', '/');
-            var slashIndex = normalized.IndexOf('/');
-            return slashIndex >= 0 && slashIndex + 1 < normalized.Length
-                ? normalized.Substring(slashIndex + 1)
-                : normalized;
-        }
-
-        public static string ReadUtf8String(Stream stream, long size)
-        {
-            return Encoding.UTF8.GetString(ReadBytes(stream, size)).TrimEnd('\0', '\r', '\n');
-        }
-
-        // The buffer grows with the bytes actually read: a header can declare far more than the archive holds.
-        public static byte[] ReadBytes(Stream stream, long size)
-        {
-            if (size > int.MaxValue)
-            {
-                throw new InvalidDataException("Archive entry is too large to read into memory.");
-            }
-
-            var buffer = new byte[Math.Min(size, InitialReadBufferBytes)];
-            var offset = 0;
-            while (offset < size)
-            {
-                if (offset == buffer.Length)
-                {
-                    Array.Resize(ref buffer, (int)Math.Min(size, buffer.LongLength * 2));
-                }
-
-                var read = stream.Read(buffer, offset, buffer.Length - offset);
-                if (read <= 0)
-                {
-                    throw new EndOfStreamException("Unexpected end of archive stream.");
-                }
-
-                offset += read;
-            }
-
-            return buffer;
-        }
-
-        public static void Skip(Stream stream, long size)
-        {
-            CopyExactly(stream, Stream.Null, size);
-        }
-
-        public static void CopyExactly(Stream input, Stream output, long size)
-        {
-            var buffer = new byte[81920];
-            var remaining = size;
-
-            while (remaining > 0)
-            {
-                var toRead = (int)Math.Min(buffer.Length, remaining);
-                var read = input.Read(buffer, 0, toRead);
-                if (read <= 0)
-                {
-                    throw new EndOfStreamException("Unexpected end of archive stream.");
-                }
-
-                output.Write(buffer, 0, read);
-                remaining -= read;
-            }
-        }
-
-        private static bool ReadExactly(Stream stream, byte[] buffer, int size)
-        {
-            var offset = 0;
-            while (offset < size)
-            {
-                var read = stream.Read(buffer, offset, size - offset);
-                if (read == 0)
-                {
-                    if (offset == 0)
-                    {
-                        return false;
-                    }
-
-                    throw new EndOfStreamException("Unexpected end of tar archive.");
-                }
-
-                offset += read;
-            }
-
-            return true;
-        }
-
-        private static void SkipPadding(Stream stream, long size)
-        {
-            var remainder = size % TarBlockSize;
-            if (remainder == 0)
-            {
-                return;
-            }
-
-            Skip(stream, TarBlockSize - remainder);
-        }
-
-        private static bool IsAllZeros(byte[] buffer)
-        {
-            for (var i = 0; i < buffer.Length; i++)
-            {
-                if (buffer[i] != 0)
-                {
-                    return false;
-                }
-            }
-
-            return true;
-        }
-
-        private static string ReadTarString(byte[] buffer, int offset, int length)
-        {
-            return Encoding.ASCII.GetString(buffer, offset, length).Trim('\0', ' ');
-        }
-
-        // Octal digits only (the POSIX field); the GNU base-256 form marks sizes no Unity package needs.
-        private static long ReadSize(byte[] header, string archiveName)
-        {
-            if ((header[124] & 0x80) != 0)
-            {
-                throw new InvalidDataException(archiveName + " declares an entry too large for a package.");
-            }
-
-            long size = 0;
-            foreach (var digit in ReadTarString(header, 124, 12))
-            {
-                if (digit < '0' || digit > '7')
-                {
-                    throw new InvalidDataException(archiveName + " is not a valid Unity package.");
-                }
-
-                size = size * 8 + (digit - '0');
-            }
-
-            return size;
         }
     }
 

@@ -14,6 +14,7 @@ namespace Orbiters.UnityPackageManager.Editor.Tests
     public sealed class UnityPackageArchiveServiceTests
     {
         private const string FolderMeta = "fileFormatVersion: 2\nguid: {0}\nfolderAsset: yes\n";
+        private const string G1 = "11111111111111111111111111111111", G2 = "22222222222222222222222222222222", G3 = "33333333333333333333333333333333";
         private readonly UnityPackageArchiveService service = new UnityPackageArchiveService();
         private string tempDirectory;
         private string projectFolder;
@@ -147,28 +148,12 @@ namespace Orbiters.UnityPackageManager.Editor.Tests
         }
 
         [Test]
-        public void DeclaredSizeIsNotAllocatedUpFront()
-        {
-            var stream = new RecordingStream(new byte[100]);
-            Assert.Throws<EndOfStreamException>(() => TarArchiveReader.ReadBytes(stream, 1L << 30));
-            Assert.LessOrEqual(stream.LargestBuffer, 1 << 20);
-        }
-
-        [Test]
-        public void GrowingReadReturnsEveryByte()
-        {
-            var data = new byte[3 * 1024 * 1024 + 7];
-            new System.Random(1).NextBytes(data);
-            Assert.IsTrue(data.SequenceEqual(TarArchiveReader.ReadBytes(new MemoryStream(data), data.Length)));
-        }
-
-        [Test]
         public void TruncatedHugeEntryFails()
         {
             var package = Path.Combine(tempDirectory, "truncated.unitypackage");
             using (var gzip = new GZipStream(File.Create(package), CompressionMode.Compress))
             {
-                gzip.Write(Header("g1/asset", 1L << 30), 0, 512);
+                gzip.Write(Header(G1 + "/asset", 1L << 30), 0, 512);
             }
 
             Assert.Throws<EndOfStreamException>(() => service.ReadEditableArchive(package));
@@ -177,21 +162,21 @@ namespace Orbiters.UnityPackageManager.Editor.Tests
         [Test]
         public void ExpandedSizeIsBounded()
         {
-            var package = WritePackage(("g1/pathname", Utf8("Assets/a.bin")), ("g1/asset", new byte[4096]));
+            var package = WritePackage((G1 + "/pathname", Utf8("Assets/a.bin")), (G1 + "/asset", new byte[4096]));
             Assert.Throws<InvalidDataException>(() => service.ReadEditableArchive(package, 2048, UnityPackageArchiveService.MaxEntries));
         }
 
         [Test]
         public void EntryCountIsBounded()
         {
-            var package = WritePackage(("g1/pathname", Utf8("Assets/a")), ("g2/pathname", Utf8("Assets/b")), ("g3/pathname", Utf8("Assets/c")));
+            var package = WritePackage((G1 + "/pathname", Utf8("Assets/a")), (G2 + "/pathname", Utf8("Assets/b")), (G3 + "/pathname", Utf8("Assets/c")));
             Assert.Throws<InvalidDataException>(() => service.ReadEditableArchive(package, UnityPackageArchiveService.MaxExpandedBytes, 2));
         }
 
         [Test]
         public void OversizedPathnameIsRejected()
         {
-            var package = WritePackage(("g1/pathname", Utf8("Assets/" + new string('a', UnityPackageArchiveService.MaxPathnameBytes))));
+            var package = WritePackage((G1 + "/pathname", Utf8("Assets/" + new string('a', UnityPackageArchiveService.MaxPathnameBytes))));
             Assert.Throws<InvalidDataException>(() => service.ReadEditableArchive(package));
         }
 
@@ -201,9 +186,7 @@ namespace Orbiters.UnityPackageManager.Editor.Tests
             var package = Path.Combine(tempDirectory, "binary-size.unitypackage");
             using (var gzip = new GZipStream(File.Create(package), CompressionMode.Compress))
             {
-                var header = Header("g1/asset", 0);
-                header[124] = 0x80;
-                gzip.Write(header, 0, 512);
+                gzip.Write(Header(G1 + "/asset", 0, header => header[124] = 0x80), 0, 512);
             }
 
             Assert.Throws<InvalidDataException>(() => service.ReadEditableArchive(package));
@@ -333,28 +316,21 @@ namespace Orbiters.UnityPackageManager.Editor.Tests
             return package;
         }
 
-        private static byte[] Header(string name, long size)
+        // A ustar header with its checksum, after any edit a test makes to it.
+        private static byte[] Header(string name, long size, Action<byte[]> edit = null)
         {
             var header = new byte[512];
             Encoding.ASCII.GetBytes(name).CopyTo(header, 0);
             Encoding.ASCII.GetBytes(Convert.ToString(size, 8).PadLeft(11, '0')).CopyTo(header, 124);
             header[156] = (byte)'0';
+            edit?.Invoke(header);
+            for (var i = 148; i < 156; i++)
+            {
+                header[i] = 32;
+            }
+
+            Encoding.ASCII.GetBytes(Convert.ToString(header.Sum(b => (int)b), 8).PadLeft(6, '0') + "\0 ").CopyTo(header, 148);
             return header;
-        }
-
-        private sealed class RecordingStream : MemoryStream
-        {
-            public int LargestBuffer;
-
-            public RecordingStream(byte[] data) : base(data)
-            {
-            }
-
-            public override int Read(byte[] buffer, int offset, int count)
-            {
-                LargestBuffer = Math.Max(LargestBuffer, buffer.Length);
-                return base.Read(buffer, offset, count);
-            }
         }
     }
 }

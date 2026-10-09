@@ -17,6 +17,13 @@ This package is split into:
 - `Runtime`: public models and interfaces other tools can call
 - `Editor`: archive reader/extractor implementation and the editor window
 
+Archives are read through Orbiters Toolkit's `UnityPackageReader`, the one `.unitypackage` reader every Orbiters tool
+shares, so UnityPackageManager requires Orbiters Toolkit 0.3.19 or newer (installed with it through the Creator
+Companion). Since 0.2.0 it refuses archives that are not well-formed Unity packages: a broken tar header checksum, a
+record name that is not `<32 hex GUID>/pathname|asset|asset.meta|preview.png`, a repeated record, two GUIDs for one asset
+path, an asset without a pathname, metadata naming another GUID, or a missing tar terminator. A pathname's first line is
+its path, as in Unity's importer.
+
 ## How To Use
 
 1. Open `Tools > Orbiters > UnityPackageManager`.
