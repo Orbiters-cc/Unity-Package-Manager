@@ -1,14 +1,14 @@
 {
   "name": "orbiters.unitypackagemanager",
   "displayName": "UnityPackageManager",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "unity": "2022.3",
   "description": "Inspect .unitypackage archives, browse and edit their contents, and import selected assets anywhere in the project.",
   "type": "tool",
   "dependencies": {},
   "gitDependencies": {},
   "vpmDependencies": {
-    "orbiters.toolkit": ">=0.3.19 <0.4.0"
+    "orbiters.toolkit": ">=0.4.0 <0.5.0"
   },
   "author": {
     "name": "blackorbit",
