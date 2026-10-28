@@ -2,6 +2,7 @@
   "name": "orbiters.unitypackagemanager.Editor",
   "references": [
     "orbiters.unitypackagemanager",
+    "Orbiters.Toolkit",
     "Orbiters.Toolkit.Editor"
   ],
   "includePlatforms": [

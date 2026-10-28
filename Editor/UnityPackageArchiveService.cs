@@ -41,7 +41,10 @@ namespace Orbiters.UnityPackageManager.Editor
             return ReadEditableArchive(unityPackageFilePath, MaxExpandedBytes, MaxEntries);
         }
 
-        internal EditableUnityPackageArchive ReadEditableArchive(string unityPackageFilePath, long maxExpandedBytes, int maxEntries)
+        /// <param name="readGuid">When given, only the records of the GUIDs it accepts keep their asset and .meta bytes, and
+        /// no record keeps its preview: every entry is listed, the others without content.</param>
+        internal EditableUnityPackageArchive ReadEditableArchive(string unityPackageFilePath, long maxExpandedBytes, int maxEntries,
+            Func<string, bool> readGuid = null)
         {
             var fullPath = ValidateUnityPackageFile(unityPackageFilePath);
             var fileInfo = new FileInfo(fullPath);
@@ -63,13 +66,13 @@ namespace Orbiters.UnityPackageManager.Editor
                         entry.OriginalAssetPath = NormalizeArchivePath(record.Pathname.Trim());
                         break;
                     case UnityPackageReader.Part.Asset:
-                        entry.AssetBytes = record.ReadAll();
+                        if (readGuid == null || readGuid(record.Guid)) entry.AssetBytes = record.ReadAll();
                         break;
                     case UnityPackageReader.Part.Meta:
-                        entry.MetaBytes = record.ReadAll();
+                        if (readGuid == null || readGuid(record.Guid)) entry.MetaBytes = record.ReadAll();
                         break;
                     case UnityPackageReader.Part.Preview:
-                        entry.PreviewBytes = record.ReadAll();
+                        if (readGuid == null) entry.PreviewBytes = record.ReadAll();
                         break;
                 }
             });
@@ -123,7 +126,19 @@ namespace Orbiters.UnityPackageManager.Editor
                 return Array.Empty<string>();
             }
 
-            var selectedEntries = ReadEditableArchive(fullPath).Entries
+            // A first pass reads only the pathnames, so the second keeps the bytes of the selected entries alone instead of
+            // the whole archive's.
+            var pathnames = UnityPackageReader.Read(fullPath,
+                new UnityPackageReader.Options { MaxExpandedBytes = MaxExpandedBytes, MaxEntries = MaxEntries, FirstLinePathname = true }).Pathnames;
+            var selectedGuids = new HashSet<string>(
+                pathnames.Where(pair => pair.Value != null && selectedPaths.Contains(NormalizeArchivePath(pair.Value.Trim()))).Select(pair => pair.Key),
+                StringComparer.OrdinalIgnoreCase);
+            if (selectedGuids.Count == 0)
+            {
+                return Array.Empty<string>();
+            }
+
+            var selectedEntries = ReadEditableArchive(fullPath, MaxExpandedBytes, MaxEntries, selectedGuids.Contains).Entries
                 .Where(entry => selectedPaths.Contains(entry.OriginalAssetPath))
                 .ToList();
 
@@ -166,9 +181,12 @@ namespace Orbiters.UnityPackageManager.Editor
                     destinationAssetPath = GenerateUniqueProjectPath(destinationAssetPath);
                 }
 
+                // Containment by name, then on disk: a junction or symbolic link already in the destination (or at the
+                // entry's own path or .meta) would take the write elsewhere.
                 if (destinationAssetPath == null ||
                     !TryGetContainedPath(destinationRoot, ProjectRelativeToAbsolute(destinationAssetPath), out var pathInDestination) ||
-                    pathInDestination.Length == 0)
+                    pathInDestination.Length == 0 ||
+                    !IsFreeOfLinks(destinationRoot, ProjectRelativeToAbsolute(destinationAssetPath)))
                 {
                     refused.Add(entry.OriginalAssetPath);
                     continue;
@@ -183,6 +201,25 @@ namespace Orbiters.UnityPackageManager.Editor
             refusedPaths = refused;
             AssetDatabase.Refresh();
             return outputPaths;
+        }
+
+        /// <summary>
+        /// Whether <paramref name="absolutePath"/> and its .meta reach <paramref name="root"/> without a symbolic link or
+        /// junction on the way (Orbiters Toolkit's <see cref="Orbiters.Toolkit.Storage.SafePaths.RejectLinks"/>; the root
+        /// itself must not be one either).
+        /// </summary>
+        internal static bool IsFreeOfLinks(string root, string absolutePath)
+        {
+            try
+            {
+                Orbiters.Toolkit.Storage.SafePaths.RejectLinks(root, absolutePath);
+                Orbiters.Toolkit.Storage.SafePaths.RejectLinks(root, absolutePath + ".meta");
+                return true;
+            }
+            catch (InvalidDataException)
+            {
+                return false;
+            }
         }
 
         internal static string DescribeRefusedEntries(IReadOnlyCollection<string> refusedPaths, string destinationFolder)

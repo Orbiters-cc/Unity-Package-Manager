@@ -10,6 +10,14 @@ It adds a window at `Tools > Orbiters > UnityPackageManager` where you can:
 - import selected assets into a chosen folder
 - drag selected assets from the window into folders in the Project window
 
+## Unreleased
+
+- **Imports never write through a link.** An entry whose destination (or its .meta) goes through a junction or symbolic
+  link already in the destination folder is skipped like any entry that would land outside it (Orbiters Toolkit's
+  `SafePaths.RejectLinks`), instead of being written wherever the link points.
+- **Importing selected assets reads only theirs.** A first pass reads the archive's pathnames, the second keeps the bytes
+  of the selected entries alone (no previews), instead of holding the whole archive in memory to import one file.
+
 ## Package Structure
 
 This package is split into:

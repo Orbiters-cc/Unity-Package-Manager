@@ -216,6 +216,76 @@ namespace Orbiters.UnityPackageManager.Editor.Tests
         }
 
         [Test]
+        public void EntriesThroughAJunctionInTheDestinationAreRefused()
+        {
+            if (Application.platform != RuntimePlatform.WindowsEditor)
+            {
+                Assert.Ignore("Junctions are a Windows feature.");
+            }
+
+            // The destination already holds a junction to a folder outside it: an entry under it would pass the containment
+            // by name and land outside.
+            projectFolder = "Assets/__UpmTests_" + NewGuid().Substring(0, 8);
+            var destination = projectFolder + "/Dest";
+            Directory.CreateDirectory(Path.GetFullPath(destination));
+            var outside = Path.Combine(tempDirectory, "outside");
+            Directory.CreateDirectory(outside);
+            var junction = Path.GetFullPath(destination + "/Linked");
+            var mklink = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo("cmd.exe", "/c mklink /J \"" + junction + "\" \"" + outside + "\"")
+            {
+                CreateNoWindow = true,
+                UseShellExecute = false
+            });
+            mklink.WaitForExit();
+            if (!Directory.Exists(junction) || (File.GetAttributes(junction) & FileAttributes.ReparsePoint) == 0)
+            {
+                Assert.Ignore("Could not create a junction here.");
+            }
+
+            try
+            {
+                var entries = new[] { FileEntry(NewGuid(), "Assets/Linked/evil.txt", "evil"), FileEntry(NewGuid(), "Assets/Plain/ok.txt", "ok") };
+                var imported = service.ExtractEntries(entries, destination, new UnityPackageImportOptions { PreservePackageHierarchy = true, OverwriteExistingFiles = true }, out var refused);
+
+                CollectionAssert.AreEqual(new[] { destination + "/Plain/ok.txt" }, imported);
+                CollectionAssert.AreEqual(new[] { "Assets/Linked/evil.txt" }, refused);
+                Assert.IsEmpty(Directory.GetFileSystemEntries(outside));
+            }
+            finally
+            {
+                // Only the link goes: deleting it never touches the folder it points to.
+                Directory.Delete(junction);
+                File.Delete(junction + ".meta");
+            }
+        }
+
+        [Test]
+        public void ExtractingSelectedAssetsReadsOnlyThem()
+        {
+            projectFolder = "Assets/__UpmTests_" + NewGuid().Substring(0, 8);
+            string wanted = NewGuid(), other = NewGuid();
+            var package = WritePackage(
+                (other + "/pathname", Utf8("Assets/Hat/big.bytes")),
+                (other + "/asset", new byte[4096]),
+                (wanted + "/asset", Utf8("hat")),
+                (wanted + "/pathname", Utf8("Assets/Hat/hat.txt")));
+
+            var imported = service.ExtractAssets(package, new[] { "Assets/Hat/hat.txt" }, projectFolder,
+                new UnityPackageImportOptions { PreservePackageHierarchy = true }, out var refused);
+
+            Assert.IsEmpty(refused);
+            CollectionAssert.AreEqual(new[] { projectFolder + "/Hat/hat.txt" }, imported);
+            Assert.AreEqual("hat", File.ReadAllText(projectFolder + "/Hat/hat.txt"));
+            Assert.IsFalse(File.Exists(projectFolder + "/Hat/big.bytes"));
+
+            var partial = service.ReadEditableArchive(package, UnityPackageArchiveService.MaxExpandedBytes, UnityPackageArchiveService.MaxEntries,
+                guid => guid == wanted);
+            Assert.AreEqual(2, partial.Entries.Count, "Every entry is listed.");
+            Assert.IsNull(partial.Entries.Single(e => e.PackageGuid == other).AssetBytes, "Unselected bytes are not read.");
+            Assert.AreEqual("hat", Encoding.UTF8.GetString(partial.Entries.Single(e => e.PackageGuid == wanted).AssetBytes));
+        }
+
+        [Test]
         public void FlattenedParentNameIsRefused()
         {
             projectFolder = "Assets/__UpmTests_" + NewGuid().Substring(0, 8);
